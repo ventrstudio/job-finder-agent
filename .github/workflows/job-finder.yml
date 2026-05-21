@@ -43,6 +43,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           EMAILIT_API_KEY: ${{ secrets.EMAILIT_API_KEY }}
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
           SKIP_SCRAPE: ${{ inputs.skip_scrape && '1' || '' }}
           SCORE_LIMIT: ${{ inputs.score_limit }}
         run: python main.py
