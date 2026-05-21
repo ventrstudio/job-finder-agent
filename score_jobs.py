@@ -157,7 +157,7 @@ def score_job(job: dict, profile: dict) -> Optional[dict]:
         response_text = generate(
             prompt=prompt,
             system_prompt=SCORING_SYSTEM_PROMPT,
-            temperature=0.2,
+            temperature=0,  # deterministic — same job scores the same every time
             max_tokens=400,
         )
 

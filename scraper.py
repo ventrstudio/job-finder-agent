@@ -205,10 +205,7 @@ def scrape_all_queries() -> list:
             continue
 
         if job.get("company") and job.get("job_title"):
-            key = (
-                job["company"].strip().lower(),
-                job["job_title"].strip().lower(),
-            )
+            key = supabase_utils.normalize_key(job["company"], job["job_title"])
             if key in existing_company_title_pairs or key in seen_company_title:
                 continue
             seen_company_title.add(key)

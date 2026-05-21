@@ -12,6 +12,7 @@ from typing import Optional
 import httpx
 
 import config
+import supabase_utils
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -235,6 +236,18 @@ def send_digest(scored_jobs: list) -> bool:
     # Filter to threshold and sort by score descending
     qualified_jobs = [j for j in scored_jobs if j.get("score", 0) >= config.SCORING_THRESHOLD]
     qualified_jobs.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    # Safety net: drop duplicate listings (same job pulled from two search
+    # URLs). Sorted score-desc, so the copy kept is the highest-scored one.
+    seen_keys = set()
+    deduped = []
+    for j in qualified_jobs:
+        k = supabase_utils.normalize_key(j.get("company", ""), j.get("job_title", ""))
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        deduped.append(j)
+    qualified_jobs = deduped
 
     if not qualified_jobs:
         logging.info(f"No jobs met the threshold ({config.SCORING_THRESHOLD}/10). Skipping email.")

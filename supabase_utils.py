@@ -3,6 +3,7 @@ import config
 from typing import Optional, Any, Dict
 import datetime
 import logging
+import re
 import time
 
 # --- Initialize Supabase Client ---
@@ -11,6 +12,19 @@ if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
     raise ValueError("Supabase URL and Key must be set in environment variables or config.")
 
 supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY)
+
+
+def normalize_key(company: str, job_title: str) -> tuple:
+    """
+    Normalized (company, job_title) key for dedup. Collapses case, whitespace,
+    and punctuation so "Staff Engineer / Team Lead" and "Staff Engineer/Team
+    Lead" resolve to the same key — the same posting pulled from two search
+    URLs no longer slips through as a duplicate.
+    """
+    def _n(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+    return (_n(company), _n(job_title))
+
 
 # --- Supabase Functions ---
 def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple:
@@ -47,9 +61,7 @@ def get_existing_jobs_from_supabase(batch_size: int = 1000) -> tuple:
                     existing_ids.add(str(job_id))
 
                 if company and job_title:
-                    normalized_company = company.strip().lower()
-                    normalized_title = job_title.strip().lower()
-                    existing_company_title_keys.add((normalized_company, normalized_title))
+                    existing_company_title_keys.add(normalize_key(company, job_title))
 
             offset += batch_size
 
