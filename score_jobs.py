@@ -62,15 +62,18 @@ def build_scoring_prompt(job: dict, profile: dict) -> str:
 **Positive Signal Keywords (boost score):**
 n8n, Make, Zapier, automation platforms, AI, LLM, Claude, OpenAI, GPT, Gemini, AI integration, AI implementation, Supabase, Airtable, Firebase, PostgreSQL, React, Next.js, Framer, web development, API integration, webhook, workflow automation, no-code, low-code, citizen developer, MCP, Model Context Protocol, AI agents, Cursor, Claude Code, AI-assisted development, CRM, process optimization, digital transformation, UI/UX, design systems, frontend development
 
-**Automatic Dealbreakers (score 1-2):**
-- Requires a CS degree
-- Requires 5+ years traditional coding experience
-- On-call / pager duty
-- Heavy people management roles
-- Java, .NET, C++, enterprise legacy stacks
-- Heavy data science / ML model training / statistical modeling
-- Manual QA / software testing
-- DevOps, infrastructure, sysadmin, cloud ops
+**Automatic Dealbreakers (score 1-2) — only when this is the CORE of the role, not an incidental mention:**
+- Strictly requires a CS degree with no "or equivalent experience" path
+- On-call / pager duty as a routine expectation
+- Heavy people management (leading a team is the main job)
+- Java, .NET, C++, or enterprise legacy stacks as the primary tech
+- Heavy data science / ML model training / statistical modeling as the main work
+- Manual QA / software testing as the primary role
+- Pure DevOps, infrastructure, sysadmin, or cloud-ops as the primary role
+
+A job asking for "5+ years experience" (or similar) is NOT a dealbreaker. The
+candidate actively applies to and interviews for roles with those asks. Judge
+on skill and role fit, not years-of-experience requirements.
 
 **Bilingual bonus:** English (native) + Spanish (fluent). Roles valuing bilingual get a score boost.
 
