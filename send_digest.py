@@ -154,6 +154,13 @@ def build_email_html(scored_jobs: list) -> str:
         if listing_url:
             listing_link = f'<a href="{listing_url}" style="color:#2563eb;text-decoration:none;font-size:13px;">View Listing &rarr;</a>'
 
+        # The job title itself links to the listing — clicking the title is the
+        # natural move. Falls back to plain text when no URL is available.
+        if listing_url:
+            title_html = f'<a href="{listing_url}" style="color:#111827;text-decoration:none;">{title}</a>'
+        else:
+            title_html = title
+
         pros_cons_html = _render_pros_cons(pros, cons)
 
         rows += f"""
@@ -162,7 +169,7 @@ def build_email_html(scored_jobs: list) -> str:
                 <table style="width:100%;border-collapse:collapse;">
                     <tr>
                         <td style="vertical-align:top;">
-                            <div style="font-size:17px;font-weight:600;color:#111827;">{title}</div>
+                            <div style="font-size:17px;font-weight:600;color:#111827;">{title_html}</div>
                             <div style="font-size:14px;color:#6b7280;margin-top:2px;">{company}</div>
                         </td>
                         <td style="text-align:right;vertical-align:top;white-space:nowrap;">
