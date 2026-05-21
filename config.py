@@ -13,6 +13,11 @@ ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY")
 EMAILIT_API_KEY: str = os.environ.get("EMAILIT_API_KEY")
 APIFY_TOKEN: str = os.environ.get("APIFY_TOKEN")
 
+# Heartbeat monitor (dead-man's-switch). Optional — leave unset and the
+# pipeline simply skips the ping. Set it to a healthchecks.io ping URL to
+# get alerted by email if the pipeline ever stops running at all.
+HEALTHCHECK_URL: str = os.environ.get("HEALTHCHECK_URL", "")
+
 # =================================================================
 # 2. SEARCH CONFIGURATION
 # =================================================================

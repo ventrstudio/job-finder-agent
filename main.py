@@ -12,7 +12,10 @@ Designed to run twice daily via Claude Code Routines (or n8n fallback).
 
 import logging
 import os
+import sys
 import time
+
+import httpx
 
 import config
 import cost_tracker
@@ -22,6 +25,22 @@ from score_jobs import score_unscored_jobs
 from send_digest import send_digest, send_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def ping_heartbeat():
+    """
+    Ping the external heartbeat monitor so it knows the pipeline ran.
+    Dormant until HEALTHCHECK_URL is set — a no-op otherwise, so this is
+    safe to ship before the monitor account exists.
+    """
+    url = config.HEALTHCHECK_URL
+    if not url:
+        return
+    try:
+        httpx.get(url, timeout=10)
+        logging.info("Heartbeat ping sent.")
+    except Exception as e:
+        logging.warning(f"Heartbeat ping failed: {e}")
 
 
 def run_pipeline():
@@ -80,6 +99,9 @@ def run_pipeline():
     logging.info(f"\n{cost_tracker.tracker.summary()}")
     logging.info("=" * 60)
 
+    # Tell the heartbeat monitor this run happened.
+    ping_heartbeat()
+
 
 if __name__ == "__main__":
     # Validate required config
@@ -104,3 +126,10 @@ if __name__ == "__main__":
                 f"The pipeline crashed with an uncaught error:\n\n{e}",
             )
             raise  # surface as a failed GitHub Actions run, no more fake green
+
+        # Scrape failed but the pipeline still finished its other steps and
+        # already sent its alert email. Exit non-zero so the GitHub run also
+        # shows red — visible even if the alert email never arrives.
+        if scraper.LAST_SCRAPE_ERROR:
+            logging.error("Exiting non-zero: the scraper failed earlier this run.")
+            sys.exit(1)
