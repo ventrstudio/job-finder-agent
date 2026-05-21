@@ -1,6 +1,9 @@
-python-dotenv
-supabase
-httpx
-pydantic
-apify-client
-anthropic
+# Pinned 05-21-2026. Unpinned deps let apify-client float to 3.0.0, which
+# broke scraper.py (Run object replaced the old dict). Pin everything so a
+# third-party release can never silently break the pipeline again.
+python-dotenv==1.2.2
+supabase==2.30.0
+httpx==0.28.1
+pydantic==2.13.4
+apify-client==3.0.0
+anthropic==0.103.1

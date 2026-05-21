@@ -1,8 +1,9 @@
 """
 Job scraper using Apify borderline/indeed-scraper actor.
 
-Scrapes Indeed for remote part-time/contract roles matching the agent profile's
-target queries. Replaces JobSpy (which got blocked from datacenter IPs).
+Scrapes Indeed for both nationwide remote roles and on-site/hybrid roles near
+the agent's home base, across part-time, contract, and full-time job types.
+Replaces JobSpy (which got blocked from datacenter IPs).
 
 Single actor run per pipeline. All queries packed into urls[] input.
 """
@@ -19,6 +20,10 @@ import supabase_utils
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 _apify_client = None
+
+# Set to an error string when the last scrape hit a hard failure (vs a genuine
+# "no new jobs" day). main.py reads this to fire a failure alert email.
+LAST_SCRAPE_ERROR = None
 
 
 def _get_client() -> ApifyClient:
@@ -110,23 +115,28 @@ def _map_apify_item(item: dict) -> dict:
     }
 
 
-def _build_indeed_url(query: str) -> str:
+def _build_indeed_url(query: str, *, remote: bool) -> str:
     """
-    Build an Indeed search URL with multi-jobType filter and remote+24hr filters.
+    Build an Indeed search URL with multi-jobType filter and a 24hr filter.
     Indeed's compound filter syntax `sc=0kf:jt(parttime),jt(contract);` accepts
     multiple job types in one URL.
+
+    remote=True  -> nationwide remote-only listings (Indeed remotejob filter).
+    remote=False -> on-site/hybrid listings near the local base (l + radius).
     """
     q = quote_plus(query)
     types = ",".join(f"jt({t})" for t in config.APIFY_JOB_TYPES)
     sc = quote_plus(f"0kf:{types};")
-    fromage = config.APIFY_FROM_DAYS
-    return (
+    base = (
         f"https://www.indeed.com/jobs?q={q}"
         f"&sc={sc}"
-        f"&fromage={fromage}"
+        f"&fromage={config.APIFY_FROM_DAYS}"
         f"&sort={config.APIFY_SORT}"
-        f"&remotejob=032b3046-06a3-4876-8dfd-474eb5e7ed11"
     )
+    if remote:
+        return base + "&remotejob=032b3046-06a3-4876-8dfd-474eb5e7ed11"
+    loc = quote_plus(config.APIFY_LOCAL_LOCATION)
+    return base + f"&l={loc}&radius={config.APIFY_LOCAL_RADIUS}"
 
 
 def scrape_all_queries() -> list:
@@ -134,14 +144,22 @@ def scrape_all_queries() -> list:
     Single Apify run, all queries packed as urls[]. Dedupe against DB + within run.
     Hard cap via APIFY_MAX_ROWS_GLOBAL.
     """
+    global LAST_SCRAPE_ERROR
+    LAST_SCRAPE_ERROR = None
+
     logging.info("--- Starting Job Scraping (Apify borderline, single run) ---")
 
     existing_ids, existing_company_title_pairs = supabase_utils.get_existing_jobs_from_supabase()
     logging.info(f"Found {len(existing_ids)} existing jobs in database")
 
     client = _get_client()
-    urls = [_build_indeed_url(q) for q in config.SEARCH_QUERIES]
-    logging.info(f"Built {len(urls)} Indeed URLs for one actor run")
+    remote_urls = [_build_indeed_url(q, remote=True) for q in config.SEARCH_QUERIES]
+    local_urls = [_build_indeed_url(q, remote=False) for q in config.SEARCH_QUERIES]
+    urls = remote_urls + local_urls
+    logging.info(
+        f"Built {len(urls)} Indeed URLs for one actor run "
+        f"({len(remote_urls)} remote + {len(local_urls)} local near {config.APIFY_LOCAL_LOCATION})"
+    )
 
     run_input = {
         "urls": urls,
@@ -155,12 +173,15 @@ def scrape_all_queries() -> list:
     raw_items = []
     try:
         run = client.actor(config.APIFY_ACTOR_ID).call(run_input=run_input)
-        dataset_id = run.get("defaultDatasetId") if run else None
+        # apify-client 3.x returns a Run model object, not a dict.
+        # The dataset id is the `default_dataset_id` attribute.
+        dataset_id = run.default_dataset_id if run else None
         if dataset_id:
             for item in client.dataset(dataset_id).iterate_items():
                 raw_items.append(item)
         logging.info(f"Actor returned {len(raw_items)} raw items")
     except Exception as e:
+        LAST_SCRAPE_ERROR = str(e)
         logging.error(f"Apify scrape failed: {e}")
         return []
 
@@ -168,9 +189,15 @@ def scrape_all_queries() -> list:
     seen_ids = set()
     seen_company_title = set()
 
+    blocklist = [b.lower() for b in config.COMPANY_BLOCKLIST]
+
     for item in raw_items:
         job = _map_apify_item(item)
         if not job:
+            continue
+
+        company_l = (job.get("company") or "").lower()
+        if company_l and any(b in company_l for b in blocklist):
             continue
 
         job_id = job["job_id"]

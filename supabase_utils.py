@@ -3,6 +3,7 @@ import config
 from typing import Optional, Any, Dict
 import datetime
 import logging
+import time
 
 # --- Initialize Supabase Client ---
 # Ensure URL and Key are provided
@@ -90,32 +91,39 @@ def save_jobs_to_supabase(jobs_data: list):
         print("No valid job data remaining after processing.")
         return
 
-    print(f"Attempting to upsert {len(processed_jobs_data)} jobs to Supabase...")
+    total = len(processed_jobs_data)
+    print(f"Attempting to upsert {total} jobs to Supabase...")
 
-    try:
-        # Use table name from config
-        # Use upsert instead of insert. It will insert new rows
-        # or update existing rows if a job_id conflict occurs based on the primary key.
-        # Ensure 'job_id' is the primary key or has a unique constraint in your Supabase table.
-        # By default, supabase-py's upsert updates the row on conflict.
-        data, count = supabase.table(config.SUPABASE_TABLE_NAME).upsert(processed_jobs_data).execute()
+    # Upsert in small batches with retry. One giant upsert of every job in a
+    # single request is fragile: a transient TLS error (SSLV3_ALERT_BAD_RECORD_MAC)
+    # loses the whole run. Small batches + retry keep a blip from wiping everything.
+    BATCH_SIZE = 25
+    MAX_RETRIES = 3
+    saved = 0
+    failed = 0
 
-        # Check the actual response structure from your Supabase client version for upsert
-        # It might differ slightly from insert's response structure
-        if data and isinstance(data, tuple) and len(data) > 1:
-             # The actual data returned might be in data[1] for upsert
-             actual_data = data[1]
-             print(f"Successfully upserted/updated {len(processed_jobs_data)} jobs. Supabase response count: {count}")
-             # You might want to log the actual response data for debugging:
-             # print(f"Supabase response data: {actual_data}")
-        else:
-             # Log raw response if structure is unexpected or for debugging
-             print(f"Attempted to upsert {len(processed_jobs_data)} jobs. Supabase response: {data}")
+    for start in range(0, total, BATCH_SIZE):
+        batch = processed_jobs_data[start:start + BATCH_SIZE]
+        batch_num = start // BATCH_SIZE + 1
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                supabase.table(config.SUPABASE_TABLE_NAME).upsert(batch).execute()
+                saved += len(batch)
+                break
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    print(f"Upsert batch {batch_num} attempt {attempt} failed: {e}. Retrying...")
+                    time.sleep(2 * attempt)
+                else:
+                    failed += len(batch)
+                    print(f"Upsert batch {batch_num} failed after {MAX_RETRIES} attempts: {e}")
 
-    except Exception as e:
-        print(f"Error upserting data to Supabase: {e}")
-        # Consider logging the data that failed to upsert for debugging
-        # print(f"Failed data: {processed_jobs_data}")
+    print(f"Upsert complete: {saved} saved, {failed} failed (of {total}).")
+
+    # Total wipeout = a real outage. Raise so the pipeline alerts and the
+    # GitHub run goes red instead of reporting a false success.
+    if total and saved == 0:
+        raise RuntimeError(f"All {total} job upserts failed. See batch errors above.")
 
 
 def get_jobs_to_score(limit: int) -> list:

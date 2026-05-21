@@ -25,7 +25,7 @@ Score each job on a scale of 1-10:
 - 7-8: Good fit, strong alignment
 - 9-10: Excellent fit, nearly perfect match
 
-IMPORTANT: The candidate is ONLY looking for part-time, contract, freelance, or project-based work (10-20 hrs/week). Full-time roles should be scored lower unless they explicitly mention flexibility.
+JOB TYPE: The candidate prefers part-time, contract, freelance, or project-based work, but is also open to full-time roles when the work itself is a strong fit (AI, automation, or workflow focus). Do NOT penalize a job just for being full-time. Judge full-time roles on role fit, skills match, pay, and the dealbreakers below. A strong full-time AI/automation role can still score 7 or higher. A generic full-time role with weak fit scores on its merits, with no automatic boost.
 
 Return ONLY a JSON object with these fields:
 {

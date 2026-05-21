@@ -29,28 +29,39 @@ SEARCH_QUERIES = [
     "freelance web developer AI",
 ]
 
+# Companies to exclude entirely. Case-insensitive substring match against the
+# company name. Blocklisted companies are dropped at scrape time — never saved,
+# never scored, never shown in a digest.
+COMPANY_BLOCKLIST = [
+    "DataAnnotation",
+]
+
 # Apify scraper settings (borderline/indeed-scraper)
 APIFY_ACTOR_ID = "borderline/indeed-scraper"
 APIFY_COUNTRY = "us"
-APIFY_REMOTE = "remote"  # remote-only filter
-APIFY_JOB_TYPES = ["contract", "parttime"]  # one actor call per type
+APIFY_JOB_TYPES = ["fulltime", "contract", "parttime"]  # Indeed jt() filter values
 APIFY_FROM_DAYS = "1"  # last 24 hours
 APIFY_SORT = "date"  # newest first
 APIFY_MAX_ROWS_PER_QUERY = 15  # per Indeed search URL
-APIFY_MAX_ROWS_GLOBAL = 100  # hard ceiling per run (cost cap)
+APIFY_MAX_ROWS_GLOBAL = 150  # hard ceiling per run (cost cap)
+
+# Local search — on-site/hybrid jobs near home base. Each query runs twice:
+# once nationwide-remote, once location-bound to this area.
+APIFY_LOCAL_LOCATION = "Port St. Lucie, FL"
+APIFY_LOCAL_RADIUS = "50"  # miles — covers the Treasure Coast + north Palm Beach County
 
 # =================================================================
 # 3. SCORING CONFIGURATION
 # =================================================================
 SCORING_MODEL = "claude-haiku-4-5-20251001"
 SCORING_THRESHOLD = 5  # minimum score to include in digest (out of 10)
-JOBS_TO_SCORE_PER_RUN = 100
+JOBS_TO_SCORE_PER_RUN = 150  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
 
 # =================================================================
 # 4. EMAIL CONFIGURATION
 # =================================================================
 EMAILIT_FROM = "Job Scout <notifications@coreindustries.io>"
-EMAILIT_TO = "otis@ventr.so"
+EMAILIT_TO = "otis@ventr.studio"
 EMAILIT_API_URL = "https://api.emailit.com/v1/emails"
 
 # =================================================================
