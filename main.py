@@ -17,9 +17,9 @@ import time
 import config
 import cost_tracker
 import supabase_utils
-from scraper import scrape_all_queries
+import scraper
 from score_jobs import score_unscored_jobs
-from send_digest import send_digest
+from send_digest import send_digest, send_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -40,7 +40,15 @@ def run_pipeline():
         new_jobs = []
     else:
         logging.info("\n--- STEP 1: Scraping job boards ---")
-        new_jobs = scrape_all_queries()
+        new_jobs = scraper.scrape_all_queries()
+        if scraper.LAST_SCRAPE_ERROR:
+            logging.error(f"Scraper hit a hard failure: {scraper.LAST_SCRAPE_ERROR}")
+            send_alert(
+                "Job Scout: scraper failed",
+                "The scraper hit an error and pulled 0 new jobs:\n\n"
+                f"{scraper.LAST_SCRAPE_ERROR}\n\n"
+                "Nothing new entered the pipeline today. A fix is needed.",
+            )
 
     # Step 2: Save new jobs to Supabase
     if new_jobs:
@@ -87,4 +95,12 @@ if __name__ == "__main__":
         logging.error(f"Missing required environment variables: {', '.join(missing)}")
         logging.error("Set these in .env or your environment before running.")
     else:
-        run_pipeline()
+        try:
+            run_pipeline()
+        except Exception as e:
+            logging.error(f"Pipeline crashed: {e}", exc_info=True)
+            send_alert(
+                "Job Scout: pipeline crashed",
+                f"The pipeline crashed with an uncaught error:\n\n{e}",
+            )
+            raise  # surface as a failed GitHub Actions run, no more fake green

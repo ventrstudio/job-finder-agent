@@ -12,6 +12,7 @@ from typing import Optional
 import httpx
 
 import config
+import supabase_utils
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -154,6 +155,13 @@ def build_email_html(scored_jobs: list) -> str:
         if listing_url:
             listing_link = f'<a href="{listing_url}" style="color:#2563eb;text-decoration:none;font-size:13px;">View Listing &rarr;</a>'
 
+        # The job title itself links to the listing — clicking the title is the
+        # natural move. Falls back to plain text when no URL is available.
+        if listing_url:
+            title_html = f'<a href="{listing_url}" style="color:#111827;text-decoration:none;">{title}</a>'
+        else:
+            title_html = title
+
         pros_cons_html = _render_pros_cons(pros, cons)
 
         rows += f"""
@@ -162,7 +170,7 @@ def build_email_html(scored_jobs: list) -> str:
                 <table style="width:100%;border-collapse:collapse;">
                     <tr>
                         <td style="vertical-align:top;">
-                            <div style="font-size:17px;font-weight:600;color:#111827;">{title}</div>
+                            <div style="font-size:17px;font-weight:600;color:#111827;">{title_html}</div>
                             <div style="font-size:14px;color:#6b7280;margin-top:2px;">{company}</div>
                         </td>
                         <td style="text-align:right;vertical-align:top;white-space:nowrap;">
@@ -229,6 +237,18 @@ def send_digest(scored_jobs: list) -> bool:
     qualified_jobs = [j for j in scored_jobs if j.get("score", 0) >= config.SCORING_THRESHOLD]
     qualified_jobs.sort(key=lambda x: x.get("score", 0), reverse=True)
 
+    # Safety net: drop duplicate listings (same job pulled from two search
+    # URLs). Sorted score-desc, so the copy kept is the highest-scored one.
+    seen_keys = set()
+    deduped = []
+    for j in qualified_jobs:
+        k = supabase_utils.normalize_key(j.get("company", ""), j.get("job_title", ""))
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        deduped.append(j)
+    qualified_jobs = deduped
+
     if not qualified_jobs:
         logging.info(f"No jobs met the threshold ({config.SCORING_THRESHOLD}/10). Skipping email.")
         return True
@@ -265,4 +285,56 @@ def send_digest(scored_jobs: list) -> bool:
 
     except Exception as e:
         logging.error(f"Error sending digest email: {e}")
+        return False
+
+
+def send_alert(subject: str, body: str) -> bool:
+    """
+    Send a failure alert email via Emailit.
+
+    Used when the pipeline hits a hard error (scraper crash, uncaught
+    exception) so a silent break never goes unnoticed again.
+    """
+    if not config.EMAILIT_API_KEY:
+        logging.error("EMAILIT_API_KEY not set. Cannot send alert.")
+        return False
+
+    safe_body = (body or "").replace("<", "&lt;").replace(">", "&gt;")
+    html = (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;'
+        'max-width:600px;margin:0 auto;padding:24px;">'
+        '<h1 style="font-size:20px;color:#991b1b;">Job Scout: pipeline alert</h1>'
+        f'<p style="font-size:14px;color:#374151;line-height:1.5;white-space:pre-wrap;">{safe_body}</p>'
+        '<p style="font-size:12px;color:#9ca3af;margin-top:20px;">'
+        "Today's run did not deliver matches as expected. "
+        'Check the GitHub Actions log for the Job Finder Daily Pipeline.</p>'
+        '</div>'
+    )
+
+    logging.info(f"Sending alert email: {subject}")
+
+    try:
+        response = httpx.post(
+            config.EMAILIT_API_URL,
+            headers={
+                "Authorization": f"Bearer {config.EMAILIT_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": config.EMAILIT_FROM,
+                "to": config.EMAILIT_TO,
+                "subject": subject,
+                "html": html,
+            },
+            timeout=30,
+        )
+
+        if response.status_code in (200, 201, 202):
+            logging.info(f"Alert email sent to {config.EMAILIT_TO}")
+            return True
+        logging.error(f"Emailit alert error: {response.status_code} -- {response.text[:200]}")
+        return False
+
+    except Exception as e:
+        logging.error(f"Error sending alert email: {e}")
         return False
