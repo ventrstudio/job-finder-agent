@@ -109,6 +109,27 @@ def _render_pros_cons(pros: list, cons: list) -> str:
     return html
 
 
+def _format_posted(job: dict) -> str:
+    """Human posting age from the date_posted field, e.g. 'Posted 3 days ago'."""
+    from datetime import date, datetime
+
+    raw = job.get("date_posted")
+    if not raw:
+        return ""
+    try:
+        d = datetime.fromisoformat(str(raw)[:10]).date()
+    except (ValueError, TypeError):
+        return ""
+    days = (date.today() - d).days
+    if days <= 0:
+        label = "Posted today"
+    elif days == 1:
+        label = "Posted yesterday"
+    else:
+        label = f"Posted {days} days ago"
+    return f"{label} ({d.strftime('%b %-d')})"
+
+
 def build_email_html(scored_jobs: list) -> str:
     """Build an HTML email body from scored jobs."""
 
@@ -145,6 +166,7 @@ def build_email_html(scored_jobs: list) -> str:
                 cons = []
 
         salary = _format_salary(job)
+        posted = _format_posted(job)
         job_type = _format_job_type(job)
         type_color = _badge_color(job_type)
         score_bg = _score_color(score)
@@ -171,7 +193,7 @@ def build_email_html(scored_jobs: list) -> str:
                     <tr>
                         <td style="vertical-align:top;">
                             <div style="font-size:17px;font-weight:600;color:#111827;">{title_html}</div>
-                            <div style="font-size:14px;color:#6b7280;margin-top:2px;">{company}</div>
+                            <div style="font-size:14px;color:#6b7280;margin-top:2px;">{company}{(' &middot; ' + posted) if posted else ''}</div>
                         </td>
                         <td style="text-align:right;vertical-align:top;white-space:nowrap;">
                             <span style="display:inline-block;background:{score_bg};color:white;padding:4px 12px;border-radius:20px;font-weight:700;font-size:15px;">{score}/10</span>
@@ -193,10 +215,11 @@ def build_email_html(scored_jobs: list) -> str:
             </td>
         </tr>"""
 
-    from cost_tracker import tracker
+    # Real scoring cost this run (actual OpenRouter usage.cost, not an estimate).
+    import llm_client
     cost_line = ""
-    if tracker.num_calls > 0:
-        cost_line = f'<span style="color:#9ca3af;"> | Scoring cost: ${tracker.total_cost:.3f} ({tracker.num_calls} jobs)</span>'
+    if llm_client.run_calls > 0:
+        cost_line = f'<span style="color:#9ca3af;"> | Scoring cost: ${llm_client.run_cost_usd:.4f} ({llm_client.run_calls} calls)</span>'
 
     html = f"""
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:640px;margin:0 auto;padding:24px;">

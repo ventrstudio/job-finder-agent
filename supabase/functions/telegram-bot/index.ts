@@ -52,19 +52,36 @@ async function getProfile(): Promise<any> {
   return rows?.[0] || {};
 }
 
+// Human age from a YYYY-MM-DD date string, e.g. "posted 3 days ago".
+function agePosted(d: string | null): string | null {
+  if (!d) return null;
+  const posted = new Date(`${d}T00:00:00Z`);
+  if (isNaN(posted.getTime())) return null;
+  const now = new Date();
+  const days = Math.floor(
+    (Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) -
+      Date.UTC(posted.getUTCFullYear(), posted.getUTCMonth(), posted.getUTCDate())) / 864e5,
+  );
+  if (days <= 0) return "posted today";
+  if (days === 1) return "posted yesterday";
+  return `posted ${days} days ago`;
+}
+
 async function getRecentMatches(limit = 15): Promise<any[]> {
   const cols =
-    "job_id,job_title,company,location,is_remote,job_type,salary_min,salary_max,salary_interval,resume_score,score_tldr,job_url_direct,scraped_at";
-  return await sb(
+    "job_id,job_title,company,location,is_remote,job_type,salary_min,salary_max,salary_interval,resume_score,score_tldr,job_url_direct,date_posted,scraped_at";
+  const rows: any[] = await sb(
     `jobs?select=${cols}&is_active=eq.true&resume_score=gte.${SCORE_MATCH}` +
       `&order=resume_score.desc,scraped_at.desc&limit=${limit}`,
   );
+  for (const j of rows) j.posted = agePosted(j.date_posted) || "posting date unknown";
+  return rows;
 }
 
 async function findJob(hint: string): Promise<any | null> {
   // Try title match, then company match. ilike with wildcards.
   const enc = encodeURIComponent(`%${hint.trim()}%`);
-  const cols = "job_id,job_title,company,location,description,job_url_direct,resume_score";
+  const cols = "job_id,job_title,company,location,description,job_url_direct,date_posted,resume_score";
   let rows = await sb(
     `jobs?select=${cols}&job_title=ilike.${enc}&order=resume_score.desc&limit=1`,
   );
@@ -77,11 +94,30 @@ async function findJob(hint: string): Promise<any | null> {
 }
 
 // ---------- OpenRouter ----------
+async function logCost(source: string, model: string, usage: any): Promise<void> {
+  try {
+    await sb("llm_costs", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({
+        source,
+        model,
+        prompt_tokens: usage?.prompt_tokens ?? 0,
+        completion_tokens: usage?.completion_tokens ?? 0,
+        total_tokens: usage?.total_tokens ?? 0,
+        cost_usd: usage?.cost ?? 0,
+      }),
+    });
+  } catch (e) {
+    console.error("cost log failed", e);
+  }
+}
+
 async function llm(
   key: string,
   system: string,
   user: string,
-  opts: { json?: boolean; maxTokens?: number } = {},
+  opts: { json?: boolean; maxTokens?: number; source?: string } = {},
 ): Promise<string> {
   const body: any = {
     model: MODEL,
@@ -91,6 +127,7 @@ async function llm(
     ],
     temperature: 0.3,
     max_tokens: opts.maxTokens ?? 900,
+    usage: { include: true }, // OpenRouter returns real USD cost in usage.cost
   };
   if (opts.json) body.response_format = { type: "json_object" };
 
@@ -106,7 +143,44 @@ async function llm(
   });
   const data = await r.json();
   if (!r.ok) throw new Error(`OpenRouter ${r.status}: ${JSON.stringify(data).slice(0, 300)}`);
+  await logCost(opts.source || "bot_router", data?.model || MODEL, data?.usage);
   return (data?.choices?.[0]?.message?.content || "").trim();
+}
+
+async function costSummary(): Promise<string> {
+  // Reads the rollup; returns a short report. On-demand only (never auto-sent).
+  const rows: any[] = await sb(
+    "llm_costs?select=created_at,source,cost_usd,total_tokens&order=created_at.desc&limit=2000",
+  );
+  const now = Date.now();
+  const day = 864e5;
+  let today = 0, week = 0, month = 0, all = 0;
+  let cToday = 0, cAll = 0;
+  const bySource: Record<string, number> = {};
+  for (const r of rows) {
+    const c = Number(r.cost_usd) || 0;
+    const age = now - new Date(r.created_at).getTime();
+    all += c; cAll++;
+    bySource[r.source] = (bySource[r.source] || 0) + c;
+    if (age <= day) { today += c; cToday++; }
+    if (age <= 7 * day) week += c;
+    if (age <= 30 * day) month += c;
+  }
+  const m = (n: number) => "$" + n.toFixed(n < 0.01 ? 5 : 4);
+  const srcLines = Object.entries(bySource)
+    .sort((a, b) => b[1] - a[1])
+    .map(([s, c]) => `  • ${s}: ${m(c)}`)
+    .join("\n");
+  return [
+    "💸 <b>LLM cost</b>",
+    `Today: ${m(today)} (${cToday} calls)`,
+    `Last 7d: ${m(week)}`,
+    `Last 30d: ${m(month)}`,
+    `All time: ${m(all)} (${cAll} calls)`,
+    "",
+    "By source (all time):",
+    srcLines || "  (none yet)",
+  ].join("\n");
 }
 
 function parseJson(text: string): any {
@@ -156,6 +230,7 @@ const HELP = [
   "• <b>Cover letter</b> — “write a cover letter for the Gottlieb automation role”",
   "• <b>Edit your profile</b> — “add ‘no on-call’ to my dealbreakers”, “bump my target roles to include Solutions Engineer”",
   "• <b>Feedback</b> — “stop showing me teaching jobs”, “I’m not interested in pure DevOps”",
+  "• <b>/cost</b> — LLM token spend (today / 7d / 30d / all time)",
   "",
   "Your full digest still comes by email each morning.",
 ].join("\n");
@@ -170,7 +245,7 @@ Reply ONLY with a JSON object:
 }
 
 Rules:
-- For questions, summaries, or listing jobs: action="none", put the answer in "reply". Use the RECENT MATCHING JOBS data. Be concise; format lists with one job per line as "<b>Title</b> — Company (score/10) — link". Scores in the data are 0-100; divide by 10 for display.
+- For questions, summaries, or listing jobs: action="none", put the answer in "reply". Use the RECENT MATCHING JOBS data. Be concise. Scores in the data are 0-100; divide by 10 for display. ALWAYS include how long ago each job was posted — use each job's "posted" field verbatim (e.g. "posted 3 days ago"). Format each listed job as: "<b>Title</b> — Company · score/10 · posted X days ago" then the link on the next line.
 - For a cover letter request: action="cover_letter", args={"job_hint":"<key words from the title or company he named>"}. Put a one-line "On it…" in reply.
 - To change his profile: action="update_profile", args={"field":"<one of: target_roles, skills, job_types, location_preference, zip_code, salary_notes, custom_prompt>", "value": <the COMPLETE new value — for array fields return the full updated array including existing items>}. Confirm what you changed in reply.
 - To record a dislike/preference that should affect future scoring: action="feedback", args={"note":"<short rule, e.g. 'Not interested in DevOps or pure infrastructure roles'>"}. Confirm in reply.
@@ -215,6 +290,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return new Response("ok");
   }
 
+  if (text === "/cost" || /\bhow much.*(spent|cost)|llm cost|token cost|my spend\b/i.test(text)) {
+    try {
+      await reply(token, chatId, await costSummary());
+    } catch (e) {
+      console.error("cost summary failed", e);
+      await reply(token, chatId, "⚠️ Couldn't pull cost data right now.");
+    }
+    return new Response("ok");
+  }
+
   try {
     const [profile, jobs] = await Promise.all([getProfile(), getRecentMatches()]);
 
@@ -237,10 +322,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
           orKey,
           COVER_SYSTEM,
           `RESUME:\n${profile.resume_text || "(no resume on file)"}\n\nJOB: ${job.job_title} at ${job.company}\n${job.location || ""}\n\nDESCRIPTION:\n${(job.description || "").slice(0, 6000)}`,
-          { maxTokens: 800 },
+          { maxTokens: 800, source: "bot_cover_letter" },
         );
+        const age = agePosted(job.date_posted);
         out =
           `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}\n` +
+          (age ? `🗓 ${esc(age)}\n` : "") +
           (job.job_url_direct ? `${esc(job.job_url_direct)}\n` : "") +
           `\n${esc(letter)}`;
       }

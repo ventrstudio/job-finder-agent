@@ -27,6 +27,34 @@ logger = logging.getLogger(__name__)
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Real per-run cost totals (USD), accumulated from OpenRouter usage.cost.
+run_cost_usd: float = 0.0
+run_calls: int = 0
+
+
+def log_llm_cost(source: str, model: str, usage: dict, meta: dict | None = None) -> None:
+    """Persist one call's token usage + real USD cost to public.llm_costs.
+
+    Best-effort: never let cost logging break the pipeline.
+    """
+    global run_cost_usd, run_calls
+    run_cost_usd += float(usage.get("cost", 0) or 0)
+    run_calls += 1
+    try:
+        import supabase_utils  # local import to avoid import-time DB coupling
+
+        supabase_utils.supabase.table("llm_costs").insert({
+            "source": source,
+            "model": model,
+            "prompt_tokens": usage.get("prompt_tokens", 0) or 0,
+            "completion_tokens": usage.get("completion_tokens", 0) or 0,
+            "total_tokens": usage.get("total_tokens", 0) or 0,
+            "cost_usd": usage.get("cost", 0) or 0,
+            "meta": meta,
+        }).execute()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"llm cost logging skipped: {e}")
+
 # Optional attribution headers (OpenRouter ranks/credits these; harmless if kept).
 _HEADERS_EXTRA = {
     "HTTP-Referer": "https://ventr.studio",
@@ -42,6 +70,7 @@ def generate(
     model: Optional[str] = None,
     max_retries: int = 3,
     response_format: Optional[dict] = None,
+    source: str = "pipeline_scoring",
 ) -> str:
     """
     Generate content via OpenRouter.
@@ -64,6 +93,7 @@ def generate(
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "usage": {"include": True},  # OpenRouter returns real USD cost in usage.cost
     }
     if response_format:
         payload["response_format"] = response_format
@@ -88,16 +118,18 @@ def generate(
 
             data = resp.json()
 
-            # Cost tracking (best-effort; unknown models fall back to a default price).
+            # Cost tracking: in-run tracker + persistent llm_costs row (real USD).
+            usage = data.get("usage", {}) or {}
+            actual_model = data.get("model", model)
             try:
-                usage = data.get("usage", {}) or {}
                 cost_tracker.tracker.record(
-                    model=data.get("model", model),
+                    model=actual_model,
                     input_tokens=usage.get("prompt_tokens", 0) or 0,
                     output_tokens=usage.get("completion_tokens", 0) or 0,
                 )
             except Exception as ce:  # noqa: BLE001
                 logger.debug(f"Cost tracking skipped: {ce}")
+            log_llm_cost(source, actual_model, usage)
 
             content = (
                 data.get("choices", [{}])[0].get("message", {}).get("content", "")
