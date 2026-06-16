@@ -9,7 +9,8 @@ load_dotenv()
 SUPABASE_URL: str = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY: str = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_TABLE_NAME: str = "jobs"
-ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY")
+ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY")  # legacy, unused
+OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY")
 EMAILIT_API_KEY: str = os.environ.get("EMAILIT_API_KEY")
 APIFY_TOKEN: str = os.environ.get("APIFY_TOKEN")
 
@@ -58,7 +59,9 @@ APIFY_LOCAL_RADIUS = "50"  # miles — covers the Treasure Coast + north Palm Be
 # =================================================================
 # 3. SCORING CONFIGURATION
 # =================================================================
-SCORING_MODEL = "claude-haiku-4-5-20251001"
+# OpenRouter auto-router: picks the cheapest capable model per request, no
+# upcharge. Pin to a slug (e.g. "anthropic/claude-haiku-4.5") to override.
+SCORING_MODEL = "openrouter/auto"
 SCORING_THRESHOLD = 5  # minimum score to include in digest (out of 10)
 JOBS_TO_SCORE_PER_RUN = 150  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
 
@@ -72,9 +75,10 @@ JOBS_TO_SCORE_PER_RUN = 150  # matches APIFY_MAX_ROWS_GLOBAL so a day clears sam
 TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# EmailIt digest is retired (Core Industries domain torn down 05-29-2026).
-# Kept only so resend_digest.py / send_digest.py still import; not used by main.
-EMAILIT_FROM = "Job Scout <notifications@coreindustries.io>"
+# Email is the primary digest channel. Sender must be on the verified
+# mail.ventr.studio domain (the old coreindustries.io sender died in the
+# 05-29-2026 mail migration). Telegram carries a one-line nudge + the chat bot.
+EMAILIT_FROM = "Job Scout <alerts@mail.ventr.studio>"
 EMAILIT_TO = "otis@ventr.studio"
 EMAILIT_API_URL = "https://api.emailit.com/v1/emails"
 

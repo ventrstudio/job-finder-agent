@@ -173,6 +173,42 @@ def send_telegram_digest(scored_jobs: list) -> bool:
     return sent > 0
 
 
+def send_telegram_nudge(scored_jobs: list) -> bool:
+    """
+    Post ONE short message: how many new matches, the single best one, and a
+    pointer to the email digest + the chat bot. No per-job spam.
+    """
+    if not _enabled():
+        return False
+
+    matches = [
+        j for j in scored_jobs
+        if int(j.get("score", 0) or 0) >= config.SCORING_THRESHOLD
+    ]
+    if not matches:
+        return _send_message(
+            "\U0001F50D <b>Job Scout</b>\nNo new matches today above the score cutoff."
+        )
+
+    matches.sort(key=lambda j: int(j.get("score", 0) or 0), reverse=True)
+    best = matches[0]
+    bscore = int(best.get("score", 0) or 0)
+    btitle = html.escape(str(best.get("job_title") or "a role"))
+    bco = str(best.get("company") or "")
+    bco = "" if bco in ("", "nan") else f" @ {html.escape(bco)}"
+    n = len(matches)
+
+    text = (
+        f"\U0001F50D <b>Job Scout</b> — {n} new "
+        f"{'match' if n == 1 else 'matches'} today.\n"
+        f"\U0001F947 Top {bscore}/10: <b>{btitle}</b>{bco}\n\n"
+        f"\U0001F4E7 Full digest in your email.\n"
+        f"\U0001F4AC Message me to dig in: ask about a listing, draft a cover "
+        f"letter, tweak your profile, or give feedback."
+    )
+    return _send_message(text)
+
+
 def send_telegram_alert(subject: str, body: str) -> bool:
     """Push a failure alert to Telegram."""
     if not _enabled():

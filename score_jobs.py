@@ -150,6 +150,7 @@ def score_job(job: dict, profile: dict) -> Optional[dict]:
         Dict with score, tldr, pros, cons — or None on failure.
     """
     import json
+    import re
 
     prompt = build_scoring_prompt(job, profile)
 
@@ -158,7 +159,8 @@ def score_job(job: dict, profile: dict) -> Optional[dict]:
             prompt=prompt,
             system_prompt=SCORING_SYSTEM_PROMPT,
             temperature=0,  # deterministic — same job scores the same every time
-            max_tokens=400,
+            max_tokens=800,  # headroom so a verbose tldr can't truncate the JSON
+            response_format={"type": "json_object"},  # force clean JSON (no prose/fences)
         )
 
         # Strip markdown code fences if present
@@ -168,8 +170,15 @@ def score_job(job: dict, profile: dict) -> Optional[dict]:
             if text.endswith("```"):
                 text = text[:-3].strip()
 
-        # Parse JSON response
-        result = json.loads(text)
+        # Parse JSON response. Fall back to extracting the first {...} block so a
+        # model that adds stray prose around the object still scores.
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if not m:
+                raise
+            result = json.loads(m.group(0))
         score = int(result.get("score", 0))
         tldr = result.get("tldr", "")
         pros = result.get("pros", [])
