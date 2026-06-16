@@ -1,28 +1,32 @@
 // Telegram bot for the Job Scout — the interactive AI layer.
 //
-// Locked to a single Telegram user. Four abilities, routed by one LLM call:
+// Locked to a single Telegram user. Abilities, routed by one LLM call:
 //   1. Q&A about listings   (read jobs, answer)
-//   2. Generate cover letter (resume_text + job description -> text to paste)
+//   2. Cover letters         (Otis's proven proof-forward style, Sonnet + caching)
 //   3. Edit profile          (update agent_profile fields)
-//   4. Give feedback         (append a rule to agent_profile.anti_patterns)
+//   4. Feedback              (append a rule to agent_profile.anti_patterns)
+//   /cost  — LLM spend     /rubric — view+edit the scout's scoring brain
 //
-// Security:
-//   - Telegram webhook secret header must match (set via setWebhook secret_token).
-//   - message.from.id must equal allowed_user_id. Anyone else is ignored silently.
+// Conversation memory: last ~8 turns within 45 min (windowed + expiring), so
+// context never grows unbounded. Voice/cover-letter rules live in prompt_assets,
+// injected only for letters. Hybrid model: cheap auto for routing/chat, Sonnet
+// for letters (with prompt caching on the static rules).
 //
-// Secrets are function env vars (set via `supabase secrets set`):
-//   TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, ALLOWED_USER_ID, OPENROUTER_API_KEY
-// SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are auto-injected by the platform.
+// Security: webhook secret header + from.id must equal allowed_user_id.
+// Secrets are function env vars. SUPABASE_URL / SERVICE_ROLE_KEY auto-injected.
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 const SB_URL = Deno.env.get("SUPABASE_URL")!;
 const SB_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
-const MODEL = "openrouter/auto";
-const SCORE_MATCH = 50; // 0-100 scale; 50 == 5/10 threshold
+const MODEL = "google/gemini-2.5-flash-lite";          // routing / Q&A — cheap + deterministic
+const MODEL_LETTER = "anthropic/claude-sonnet-4.6";    // voice-critical letters
+const SCORE_MATCH = 50;                                // 0-100; 50 == 5/10
+const HISTORY_LIMIT = 8;                               // turns kept in context
+const HISTORY_MINUTES = 45;                            // older turns expire
 
-// ---------- tiny Supabase REST helpers (service role) ----------
+// ---------- Supabase REST (service role) ----------
 async function sb(path: string, init: RequestInit = {}): Promise<any> {
   const r = await fetch(`${SB_URL}/rest/v1/${path}`, {
     ...init,
@@ -47,12 +51,24 @@ function getConfig(): Record<string, string> {
   };
 }
 
-async function getProfile(): Promise<any> {
-  const rows = await sb("agent_profile?select=*&limit=1");
+// Slim profile for routing/Q&A — excludes resume_text (big; only letters need it).
+async function getSlimProfile(): Promise<any> {
+  const cols =
+    "id,target_roles,skills,job_types,location_preference,zip_code,salary_notes,anti_patterns,custom_prompt";
+  const rows = await sb(`agent_profile?select=${cols}&limit=1`);
   return rows?.[0] || {};
 }
 
-// Human age from a YYYY-MM-DD date string, e.g. "posted 3 days ago".
+async function getResumeText(): Promise<string> {
+  const rows = await sb("agent_profile?select=resume_text&limit=1");
+  return rows?.[0]?.resume_text || "";
+}
+
+async function getAsset(key: string): Promise<string> {
+  const rows = await sb(`prompt_assets?select=content&key=eq.${key}&limit=1`);
+  return rows?.[0]?.content || "";
+}
+
 function agePosted(d: string | null): string | null {
   if (!d) return null;
   const posted = new Date(`${d}T00:00:00Z`);
@@ -67,9 +83,9 @@ function agePosted(d: string | null): string | null {
   return `posted ${days} days ago`;
 }
 
-async function getRecentMatches(limit = 15): Promise<any[]> {
+async function getRecentMatches(limit = 12): Promise<any[]> {
   const cols =
-    "job_id,job_title,company,location,is_remote,job_type,salary_min,salary_max,salary_interval,resume_score,score_tldr,job_url_direct,date_posted,scraped_at";
+    "job_title,company,location,is_remote,job_type,salary_min,salary_max,salary_interval,resume_score,score_tldr,job_url_direct,date_posted";
   const rows: any[] = await sb(
     `jobs?select=${cols}&is_active=eq.true&resume_score=gte.${SCORE_MATCH}` +
       `&order=resume_score.desc,scraped_at.desc&limit=${limit}`,
@@ -79,18 +95,46 @@ async function getRecentMatches(limit = 15): Promise<any[]> {
 }
 
 async function findJob(hint: string): Promise<any | null> {
-  // Try title match, then company match. ilike with wildcards.
-  const enc = encodeURIComponent(`%${hint.trim()}%`);
-  const cols = "job_id,job_title,company,location,description,job_url_direct,date_posted,resume_score";
-  let rows = await sb(
-    `jobs?select=${cols}&job_title=ilike.${enc}&order=resume_score.desc&limit=1`,
-  );
-  if (!rows?.length) {
-    rows = await sb(
-      `jobs?select=${cols}&company=ilike.${enc}&order=resume_score.desc&limit=1`,
+  const cols = "job_title,company,location,description,job_url_direct,date_posted,resume_score";
+  // Try the whole hint first, then distinctive words (drop filler), matching
+  // either title or company. Picks the highest-scored hit.
+  const stop = new Set(["role", "job", "position", "posting", "listing", "the", "for", "at", "a", "an", "cover", "letter", "one"]);
+  const words = hint.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3 && !stop.has(w));
+  const tries = [hint.trim(), ...words];
+  for (const t of tries) {
+    if (!t) continue;
+    const enc = encodeURIComponent(`*${t}*`);
+    const rows = await sb(
+      `jobs?select=${cols}&is_active=eq.true&or=(job_title.ilike.${enc},company.ilike.${enc})` +
+        `&order=resume_score.desc&limit=1`,
     );
+    if (rows?.length) return rows[0];
   }
-  return rows?.[0] || null;
+  return null;
+}
+
+// ---------- conversation memory ----------
+async function loadHistory(chatId: string): Promise<Array<{ role: string; content: string }>> {
+  const since = new Date(Date.now() - HISTORY_MINUTES * 60000).toISOString();
+  const rows: any[] = await sb(
+    `bot_conversations?select=role,content&chat_id=eq.${encodeURIComponent(chatId)}` +
+      `&created_at=gte.${since}&order=created_at.desc&limit=${HISTORY_LIMIT}`,
+  );
+  const hist = rows.reverse().map((r) => ({ role: r.role, content: r.content }));
+  while (hist.length && hist[0].role === "assistant") hist.shift(); // must start with user
+  return hist;
+}
+
+async function saveTurn(chatId: string, role: string, content: string): Promise<void> {
+  try {
+    await sb("bot_conversations", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ chat_id: chatId, role, content: String(content).slice(0, 8000) }),
+    });
+  } catch (e) {
+    console.error("saveTurn failed", e);
+  }
 }
 
 // ---------- OpenRouter ----------
@@ -113,23 +157,33 @@ async function logCost(source: string, model: string, usage: any): Promise<void>
   }
 }
 
-async function llm(
-  key: string,
-  system: string,
-  user: string,
-  opts: { json?: boolean; maxTokens?: number; source?: string } = {},
-): Promise<string> {
+interface CallOpts {
+  model?: string;
+  system: string;
+  user: string;
+  history?: Array<{ role: string; content: string }>;
+  json?: boolean;
+  maxTokens?: number;
+  cacheSystem?: boolean; // mark static system for Anthropic prompt caching
+  source?: string;
+}
+
+async function callLLM(key: string, o: CallOpts): Promise<string> {
+  const sysContent = o.cacheSystem
+    ? [{ type: "text", text: o.system, cache_control: { type: "ephemeral" } }]
+    : o.system;
+  const messages: any[] = [{ role: "system", content: sysContent }];
+  for (const h of o.history || []) messages.push({ role: h.role, content: h.content });
+  messages.push({ role: "user", content: o.user });
+
   const body: any = {
-    model: MODEL,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
+    model: o.model || MODEL,
+    messages,
     temperature: 0.3,
-    max_tokens: opts.maxTokens ?? 900,
-    usage: { include: true }, // OpenRouter returns real USD cost in usage.cost
+    max_tokens: o.maxTokens ?? 900,
+    usage: { include: true },
   };
-  if (opts.json) body.response_format = { type: "json_object" };
+  if (o.json) body.response_format = { type: "json_object" };
 
   const r = await fetch(OPENROUTER_URL, {
     method: "POST",
@@ -143,19 +197,17 @@ async function llm(
   });
   const data = await r.json();
   if (!r.ok) throw new Error(`OpenRouter ${r.status}: ${JSON.stringify(data).slice(0, 300)}`);
-  await logCost(opts.source || "bot_router", data?.model || MODEL, data?.usage);
+  await logCost(o.source || "bot_router", data?.model || o.model || MODEL, data?.usage);
   return (data?.choices?.[0]?.message?.content || "").trim();
 }
 
 async function costSummary(): Promise<string> {
-  // Reads the rollup; returns a short report. On-demand only (never auto-sent).
   const rows: any[] = await sb(
-    "llm_costs?select=created_at,source,cost_usd,total_tokens&order=created_at.desc&limit=2000",
+    "llm_costs?select=created_at,source,cost_usd&order=created_at.desc&limit=2000",
   );
   const now = Date.now();
   const day = 864e5;
-  let today = 0, week = 0, month = 0, all = 0;
-  let cToday = 0, cAll = 0;
+  let today = 0, week = 0, month = 0, all = 0, cToday = 0, cAll = 0;
   const bySource: Record<string, number> = {};
   for (const r of rows) {
     const c = Number(r.cost_usd) || 0;
@@ -167,27 +219,40 @@ async function costSummary(): Promise<string> {
     if (age <= 30 * day) month += c;
   }
   const m = (n: number) => "$" + n.toFixed(n < 0.01 ? 5 : 4);
-  const srcLines = Object.entries(bySource)
-    .sort((a, b) => b[1] - a[1])
-    .map(([s, c]) => `  • ${s}: ${m(c)}`)
-    .join("\n");
+  const srcLines = Object.entries(bySource).sort((a, b) => b[1] - a[1])
+    .map(([s, c]) => `  • ${s}: ${m(c)}`).join("\n");
   return [
     "💸 <b>LLM cost</b>",
     `Today: ${m(today)} (${cToday} calls)`,
     `Last 7d: ${m(week)}`,
     `Last 30d: ${m(month)}`,
     `All time: ${m(all)} (${cAll} calls)`,
+    "", "By source (all time):", srcLines || "  (none yet)",
+  ].join("\n");
+}
+
+async function rubricSummary(): Promise<string> {
+  const p = await getSlimProfile();
+  const arr = (x: any) => (Array.isArray(x) && x.length ? x.join(", ") : "(none)");
+  const txt = (x: any) => (x ? String(x) : "(none)");
+  return [
+    "🧠 <b>Scout's scoring brain</b>",
     "",
-    "By source (all time):",
-    srcLines || "  (none yet)",
+    `<b>Target roles:</b> ${esc(arr(p.target_roles))}`,
+    `<b>Skills:</b> ${esc(arr(p.skills))}`,
+    `<b>Job types:</b> ${esc(arr(p.job_types))}`,
+    `<b>Location pref:</b> ${esc(txt(p.location_preference))}`,
+    `<b>Salary notes:</b> ${esc(txt(p.salary_notes))}`,
+    `<b>Avoid (anti-patterns):</b> ${esc(arr(p.anti_patterns))}`,
+    `<b>Custom scoring rules:</b> ${esc(txt(p.custom_prompt))}`,
+    "",
+    "Edit any of it by just telling me — e.g. “add Solutions Engineer to my target roles”, “stop ranking DevOps high”, “weight automation roles up”. Takes effect on the next scoring run.",
   ].join("\n");
 }
 
 function parseJson(text: string): any {
   let t = text.trim();
-  if (t.startsWith("```")) {
-    t = t.replace(/^```[a-z]*\n?/i, "").replace(/```$/, "").trim();
-  }
+  if (t.startsWith("```")) t = t.replace(/^```[a-z]*\n?/i, "").replace(/```$/, "").trim();
   try {
     return JSON.parse(t);
   } catch {
@@ -207,7 +272,6 @@ async function tg(token: string, method: string, payload: any): Promise<void> {
 }
 
 async function reply(token: string, chatId: number, text: string): Promise<void> {
-  // Telegram caps at 4096 chars; chunk on paragraph boundaries.
   const LIMIT = 3800;
   for (let i = 0; i < text.length; i += LIMIT) {
     await tg(token, "sendMessage", {
@@ -224,44 +288,41 @@ function esc(s: string): string {
 }
 
 const HELP = [
-  "🔍 <b>Job Scout</b> — I’m your job assistant. Talk to me normally:",
+  "🔍 <b>Job Scout</b> — I’m your job assistant. Talk to me normally, I remember the last few messages:",
   "",
-  "• <b>Ask about listings</b> — “show today’s top 5 remote roles”, “any contract gigs?”, “tell me about the Stack AV one”",
-  "• <b>Cover letter</b> — “write a cover letter for the Gottlieb automation role”",
-  "• <b>Edit your profile</b> — “add ‘no on-call’ to my dealbreakers”, “bump my target roles to include Solutions Engineer”",
-  "• <b>Feedback</b> — “stop showing me teaching jobs”, “I’m not interested in pure DevOps”",
-  "• <b>/cost</b> — LLM token spend (today / 7d / 30d / all time)",
+  "• <b>Ask about listings</b> — “show today’s top 5 remote roles”, “tell me about the ShipBob one”",
+  "• <b>Cover letter</b> — “write a cover letter for the ShipBob role”, then “make it tighter” / “lead with the bilingual angle”",
+  "• <b>Edit your profile</b> — “add ‘no on-call’ to my dealbreakers”",
+  "• <b>Feedback</b> — “stop showing me teaching jobs”",
+  "• <b>/rubric</b> — view + edit what the scout looks for",
+  "• <b>/cost</b> — LLM spend (today / 7d / 30d / all)",
   "",
   "Your full digest still comes by email each morning.",
 ].join("\n");
 
-const ROUTER_SYSTEM = `You are the Job Scout assistant for Otis, a job seeker. You help him triage job listings, write cover letters, edit his job-search profile, and record feedback. You are given his PROFILE and a list of RECENT MATCHING JOBS as JSON.
+const ROUTER_SYSTEM = `You are the Job Scout assistant for Otis, a job seeker, chatting with him in Telegram. You can answer questions about his job matches, kick off cover letters, edit his search profile, and record feedback. You have his PROFILE and RECENT MATCHING JOBS (in this system message) plus the recent conversation (prior turns). Use the conversation for context — if he says "make it tighter" or "that one", resolve it from the history.
 
 Reply ONLY with a JSON object:
 {
-  "reply": "<your message to Otis, plain text or light HTML (<b>,<i>) — used for Q&A, lists, confirmations>",
+  "reply": "<message to Otis, plain text or light HTML (<b>,<i>)>",
   "action": "none" | "cover_letter" | "update_profile" | "feedback",
-  "args": { ... }
+  "args": { }
 }
 
 Rules:
-- For questions, summaries, or listing jobs: action="none", put the answer in "reply". Use the RECENT MATCHING JOBS data. Be concise. Scores in the data are 0-100; divide by 10 for display. ALWAYS include how long ago each job was posted — use each job's "posted" field verbatim (e.g. "posted 3 days ago"). Format each listed job as: "<b>Title</b> — Company · score/10 · posted X days ago" then the link on the next line.
-- For a cover letter request: action="cover_letter", args={"job_hint":"<key words from the title or company he named>"}. Put a one-line "On it…" in reply.
-- To change his profile: action="update_profile", args={"field":"<one of: target_roles, skills, job_types, location_preference, zip_code, salary_notes, custom_prompt>", "value": <the COMPLETE new value — for array fields return the full updated array including existing items>}. Confirm what you changed in reply.
-- To record a dislike/preference that should affect future scoring: action="feedback", args={"note":"<short rule, e.g. 'Not interested in DevOps or pure infrastructure roles'>"}. Confirm in reply.
-- Never invent jobs that aren't in the data. If asked about a job not present, say you don't see it in the recent matches.`;
-
-const COVER_SYSTEM = `You write short, sharp, proof-forward cover letters / application notes for Otis. Use his RESUME and the JOB DESCRIPTION. 180-260 words. Specific, no fluff, no clichés ("I am excited to", "fast-paced"). Lead with a concrete reason he fits. Plain text, ready to paste. No placeholders — if a detail is unknown, leave it out.`;
+- Q&A / listing jobs: action="none", answer in "reply" from RECENT MATCHING JOBS. Scores are 0-100; show score/10. ALWAYS include each job's "posted" field (e.g. "posted 3 days ago"). One job per line: "<b>Title</b> — Company · score/10 · posted X days ago".
+- Cover letter (new OR a revision of one already in the conversation): action="cover_letter", args={"job_hint":"<JUST the company name or one distinctive title word — e.g. 'ShipBob', NOT 'the ShipBob role'; reuse the same job if revising>", "instruction":"<what he wants, e.g. 'tighter', 'lead with bilingual', or 'standard'>"}. One short line in reply like "On it.".
+- Edit profile / scoring brain: action="update_profile", args={"field":"<target_roles|skills|job_types|location_preference|zip_code|salary_notes|custom_prompt>", "value": <COMPLETE new value; for arrays return the full updated array>}. Confirm in reply.
+- Record a dislike that should affect scoring: action="feedback", args={"note":"<short rule>"}. Confirm in reply.
+- Never invent jobs not in the data.`;
 
 Deno.serve(async (req: Request): Promise<Response> => {
-  // Always 200 to Telegram (so it doesn't retry); do work inside.
   const cfg = getConfig();
   const token = cfg.telegram_bot_token;
   const secret = cfg.telegram_webhook_secret;
   const allowed = String(cfg.allowed_user_id || "");
   const orKey = cfg.openrouter_api_key;
 
-  // 1) webhook secret check
   if (secret && req.headers.get("x-telegram-bot-api-secret-token") !== secret) {
     return new Response("forbidden", { status: 403 });
   }
@@ -278,7 +339,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
   const chatId = msg?.chat?.id;
   const text = (msg?.text || "").trim();
 
-  // 2) hard user lock
   if (!msg || fromId !== allowed) {
     console.warn(`ignored update from ${fromId} (allowed ${allowed})`);
     return new Response("ok");
@@ -289,48 +349,60 @@ Deno.serve(async (req: Request): Promise<Response> => {
     await reply(token, chatId, HELP);
     return new Response("ok");
   }
-
+  if (text === "/rubric") {
+    try { await reply(token, chatId, await rubricSummary()); }
+    catch (e) { console.error("rubric failed", e); await reply(token, chatId, "⚠️ Couldn't load the rubric."); }
+    return new Response("ok");
+  }
   if (text === "/cost" || /\bhow much.*(spent|cost)|llm cost|token cost|my spend\b/i.test(text)) {
-    try {
-      await reply(token, chatId, await costSummary());
-    } catch (e) {
-      console.error("cost summary failed", e);
-      await reply(token, chatId, "⚠️ Couldn't pull cost data right now.");
-    }
+    try { await reply(token, chatId, await costSummary()); }
+    catch (e) { console.error("cost failed", e); await reply(token, chatId, "⚠️ Couldn't pull cost data."); }
     return new Response("ok");
   }
 
+  const chatKey = String(chatId);
   try {
-    const [profile, jobs] = await Promise.all([getProfile(), getRecentMatches()]);
+    const [profile, jobs, history] = await Promise.all([
+      getSlimProfile(),
+      getRecentMatches(),
+      loadHistory(chatKey),
+    ]);
 
-    const ctx =
-      `PROFILE:\n${JSON.stringify(profile)}\n\n` +
-      `RECENT MATCHING JOBS (newest/highest first):\n${JSON.stringify(jobs)}\n\n` +
-      `OTIS SAID:\n${text}`;
+    const routerSystem =
+      ROUTER_SYSTEM +
+      `\n\n=== PROFILE ===\n${JSON.stringify(profile)}` +
+      `\n\n=== RECENT MATCHING JOBS ===\n${JSON.stringify(jobs)}`;
 
-    const routed = parseJson(await llm(orKey, ROUTER_SYSTEM, ctx, { json: true, maxTokens: 900 }));
+    const routed = parseJson(
+      await callLLM(orKey, {
+        model: MODEL, system: routerSystem, user: text, history,
+        json: true, maxTokens: 900, source: "bot_router",
+      }),
+    );
     const action = routed.action || "none";
     const args = routed.args || {};
     let out = routed.reply || "";
 
     if (action === "cover_letter") {
-      const job = await findJob(args.job_hint || text);
-      if (!job) {
-        out = `I couldn't find a job matching "${esc(args.job_hint || text)}" in your recent matches. Try the exact title or company.`;
-      } else {
-        const letter = await llm(
-          orKey,
-          COVER_SYSTEM,
-          `RESUME:\n${profile.resume_text || "(no resume on file)"}\n\nJOB: ${job.job_title} at ${job.company}\n${job.location || ""}\n\nDESCRIPTION:\n${(job.description || "").slice(0, 6000)}`,
-          { maxTokens: 800, source: "bot_cover_letter" },
-        );
-        const age = agePosted(job.date_posted);
-        out =
-          `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}\n` +
-          (age ? `🗓 ${esc(age)}\n` : "") +
-          (job.job_url_direct ? `${esc(job.job_url_direct)}\n` : "") +
-          `\n${esc(letter)}`;
-      }
+      const [asset, resume] = await Promise.all([getAsset("cover_letter_system"), getResumeText()]);
+      const hint = String(args.job_hint || "").trim();
+      const job = hint ? await findJob(hint) : null;
+      const jobBlock = job
+        ? `JOB: ${job.job_title} at ${job.company}\n${job.location || ""}\n\nDESCRIPTION:\n${(job.description || "").slice(0, 6000)}`
+        : "(Revise the cover letter already in this conversation — the job is in the history above.)";
+      const instruction = String(args.instruction || "standard");
+      const letter = await callLLM(orKey, {
+        model: MODEL_LETTER,
+        system: `${asset}\n\n=== OTIS'S RESUME (for detail; do not contradict the facts above) ===\n${resume.slice(0, 3500)}`,
+        user: `${jobBlock}\n\nINSTRUCTION: ${instruction}\nUser's exact words: ${text}`,
+        history: history.slice(-6),
+        cacheSystem: true,
+        maxTokens: 900,
+        source: "bot_cover_letter",
+      });
+      const age = job ? agePosted(job.date_posted) : null;
+      out = (job ? `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}\n` + (age ? `🗓 ${esc(age)}\n` : "") +
+        (job.job_url_direct ? `${esc(job.job_url_direct)}\n` : "") + "\n" : "") + esc(letter);
     } else if (action === "update_profile") {
       const field = String(args.field || "");
       const allowedFields = [
@@ -340,27 +412,28 @@ Deno.serve(async (req: Request): Promise<Response> => {
       if (!allowedFields.includes(field)) {
         out = `I can't edit "${esc(field)}". Editable: ${allowedFields.join(", ")}.`;
       } else {
-        const patch: any = { [field]: args.value, updated_at: new Date().toISOString() };
         await sb(`agent_profile?id=eq.${profile.id}`, {
           method: "PATCH",
           headers: { Prefer: "return=minimal" },
-          body: JSON.stringify(patch),
+          body: JSON.stringify({ [field]: args.value, updated_at: new Date().toISOString() }),
         });
         out = out || `✅ Updated <b>${esc(field)}</b>.`;
       }
     } else if (action === "feedback") {
       const note = String(args.note || text);
       const cur: string[] = Array.isArray(profile.anti_patterns) ? profile.anti_patterns : [];
-      const next = [...cur, note];
       await sb(`agent_profile?id=eq.${profile.id}`, {
         method: "PATCH",
         headers: { Prefer: "return=minimal" },
-        body: JSON.stringify({ anti_patterns: next, updated_at: new Date().toISOString() }),
+        body: JSON.stringify({ anti_patterns: [...cur, note], updated_at: new Date().toISOString() }),
       });
       out = out || `✅ Noted: future scoring will weigh this. "${esc(note)}"`;
     }
 
-    await reply(token, chatId, out || "Done.");
+    out = out || "Done.";
+    await reply(token, chatId, out);
+    await saveTurn(chatKey, "user", text);
+    await saveTurn(chatKey, "assistant", out);
   } catch (e) {
     console.error("handler error", e);
     await reply(token, chatId, "⚠️ Hit an error handling that. Try rephrasing, or ask again in a moment.");

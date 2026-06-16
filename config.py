@@ -59,9 +59,10 @@ APIFY_LOCAL_RADIUS = "50"  # miles — covers the Treasure Coast + north Palm Be
 # =================================================================
 # 3. SCORING CONFIGURATION
 # =================================================================
-# OpenRouter auto-router: picks the cheapest capable model per request, no
-# upcharge. Pin to a slug (e.g. "anthropic/claude-haiku-4.5") to override.
-SCORING_MODEL = "openrouter/auto"
+# Pinned to a cheap, deterministic model for predictable cost + stable scores
+# run-to-run. Bump to "anthropic/claude-haiku-4.5" or "openrouter/auto" if
+# scoring nuance ever feels off.
+SCORING_MODEL = "google/gemini-2.5-flash-lite"
 SCORING_THRESHOLD = 5  # minimum score to include in digest (out of 10)
 JOBS_TO_SCORE_PER_RUN = 150  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
 
