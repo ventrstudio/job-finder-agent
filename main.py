@@ -22,7 +22,7 @@ import cost_tracker
 import supabase_utils
 import scraper
 from score_jobs import score_unscored_jobs
-from send_digest import send_digest, send_alert
+from telegram_notify import send_telegram_digest, send_telegram_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -62,7 +62,7 @@ def run_pipeline():
         new_jobs = scraper.scrape_all_queries()
         if scraper.LAST_SCRAPE_ERROR:
             logging.error(f"Scraper hit a hard failure: {scraper.LAST_SCRAPE_ERROR}")
-            send_alert(
+            send_telegram_alert(
                 "Job Scout: scraper failed",
                 "The scraper hit an error and pulled 0 new jobs:\n\n"
                 f"{scraper.LAST_SCRAPE_ERROR}\n\n"
@@ -82,10 +82,10 @@ def run_pipeline():
     logging.info(f"\n--- STEP 3: Scoring unscored jobs (limit={score_limit or config.JOBS_TO_SCORE_PER_RUN}) ---")
     scored_jobs = score_unscored_jobs(limit=score_limit)
 
-    # Step 4: Send email digest
-    logging.info("\n--- STEP 4: Sending email digest ---")
+    # Step 4: Send Telegram digest
+    logging.info("\n--- STEP 4: Sending Telegram digest ---")
     if scored_jobs:
-        send_digest(scored_jobs)
+        send_telegram_digest(scored_jobs)
     else:
         logging.info("No scored jobs to send in digest.")
 

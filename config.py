@@ -63,8 +63,17 @@ SCORING_THRESHOLD = 5  # minimum score to include in digest (out of 10)
 JOBS_TO_SCORE_PER_RUN = 150  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
 
 # =================================================================
-# 4. EMAIL CONFIGURATION
+# 4. DELIVERY CONFIGURATION
 # =================================================================
+# Telegram is the primary delivery channel (replaces the old EmailIt digest).
+# Both vars come from GitHub Actions secrets:
+#   TELEGRAM_BOT_TOKEN - from @BotFather
+#   TELEGRAM_CHAT_ID   - your numeric chat id (DM the bot once to get it)
+TELEGRAM_BOT_TOKEN: str = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# EmailIt digest is retired (Core Industries domain torn down 05-29-2026).
+# Kept only so resend_digest.py / send_digest.py still import; not used by main.
 EMAILIT_FROM = "Job Scout <notifications@coreindustries.io>"
 EMAILIT_TO = "otis@ventr.studio"
 EMAILIT_API_URL = "https://api.emailit.com/v1/emails"
