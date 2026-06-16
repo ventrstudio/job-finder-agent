@@ -108,8 +108,8 @@ def run_pipeline():
 if __name__ == "__main__":
     # Validate required config
     missing = []
-    if not config.ANTHROPIC_API_KEY:
-        missing.append("ANTHROPIC_API_KEY")
+    if not config.OPENROUTER_API_KEY:
+        missing.append("OPENROUTER_API_KEY")
     if not config.SUPABASE_URL:
         missing.append("SUPABASE_URL")
     if not config.SUPABASE_SERVICE_ROLE_KEY:
@@ -118,6 +118,7 @@ if __name__ == "__main__":
     if missing:
         logging.error(f"Missing required environment variables: {', '.join(missing)}")
         logging.error("Set these in .env or your environment before running.")
+        sys.exit(1)  # exit non-zero so a misconfig shows red, not fake green
     else:
         try:
             run_pipeline()
