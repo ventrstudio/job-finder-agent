@@ -359,7 +359,9 @@ Rules:
 - Cover letter (new OR a revision of one already in the conversation): action="cover_letter", args={"job_hint":"<JUST the company name or one distinctive title word — e.g. 'ShipBob', NOT 'the ShipBob role'; reuse the same job if revising>", "instruction":"<what he wants, e.g. 'tighter', 'lead with bilingual', or 'standard'>"}. One short line in reply like "On it.".
 - Edit profile / scoring brain: action="update_profile", args={"field":"<target_roles|skills|job_types|location_preference|zip_code|salary_notes|custom_prompt>", "value": <COMPLETE new value; for arrays return the full updated array>}. Confirm in reply.
 - Record a dislike that should affect scoring: action="feedback", args={"note":"<short rule>"}. Confirm in reply.
-- Never invent jobs not in the data.`;
+- Never invent jobs not in the data.
+- REVIEW-ONLY: if Otis asks you to review, propose, suggest, think about, or consider changes WITHOUT explicitly telling you to apply/save/make/do them, use action="none" and give your analysis only. Do NOT update_profile or feedback until he clearly says to apply it (e.g. "do it", "apply that", "go ahead", "save it").
+- NEVER claim you updated, saved, changed, or adjusted his profile/settings/rubric unless action is update_profile or feedback. With action="none" you must not say you changed anything — only answer or give analysis.`;
 
 Deno.serve(async (req: Request): Promise<Response> => {
   const cfg = getConfig();
