@@ -289,8 +289,8 @@ def score_unscored_jobs(limit: int = None) -> list:
 
 
 if __name__ == "__main__":
-    if not config.ANTHROPIC_API_KEY:
-        logging.error("ANTHROPIC_API_KEY not set.")
+    if not config.OPENROUTER_API_KEY:
+        logging.error("OPENROUTER_API_KEY not set.")
     elif not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
         logging.error("Supabase URL or Key not set.")
     else:
