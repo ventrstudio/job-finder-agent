@@ -5,14 +5,13 @@
 //   2. Cover letters         (Otis's proven proof-forward style, Sonnet + caching)
 //   3. Edit profile          (update agent_profile fields)
 //   4. Feedback              (append a rule to agent_profile.anti_patterns)
-//   5. Resume                (view / push a new version / revert — resume_versions table)
+//   5. Resume                (READ-ONLY: view active / list versions — resume_versions table)
 //   /cost  — LLM spend     /rubric — view+edit the scout's scoring brain
 //
-// Resume is version-controlled in resume_versions (one active row). The active
-// version's content is mirrored into agent_profile.resume_text on every change,
-// so scoring (score_jobs.py) and cover letters read it unchanged. A serverless
-// bot can't git push, so DB versioning is the equivalent; RESUME.md in the repo
-// is the human-readable export of the active version.
+// Resume is version-controlled in resume_versions (one active row), maintained
+// via Claude Code (PDF + HTML + plaintext records over time) — NOT via Telegram.
+// The bot is READ-ONLY for the resume: it reads the active version's plaintext
+// for scoring (score_jobs.py) and cover letters, but never changes it.
 //
 // Conversation memory: last ~8 turns within 45 min (windowed + expiring), so
 // context never grows unbounded. Voice/cover-letter rules live in prompt_assets,
@@ -71,64 +70,11 @@ async function getResumeText(): Promise<string> {
   return rows?.[0]?.resume_text || "";
 }
 
-// ---------- resume versioning ----------
-// resume_versions is the versioned source of truth; the active row's content is
-// mirrored back into agent_profile.resume_text so scoring + letters stay current.
-async function getActiveResume(): Promise<{ content: string; version_no: number } | null> {
-  const rows = await sb("resume_versions?select=content,version_no&is_active=eq.true&limit=1");
-  return rows?.[0] || null;
-}
-
+// ---------- resume versioning (READ-ONLY from the bot) ----------
+// resume_versions is maintained via Claude Code (PDF/HTML/plaintext records);
+// the bot only reads it. Resume edits never happen through Telegram.
 async function listResumeVersions(): Promise<any[]> {
   return await sb("resume_versions?select=version_no,note,is_active,created_at&order=version_no.desc&limit=20");
-}
-
-async function nextResumeVersionNo(): Promise<number> {
-  const rows = await sb("resume_versions?select=version_no&order=version_no.desc&limit=1");
-  return (rows?.[0]?.version_no || 0) + 1;
-}
-
-// Mirror a resume into agent_profile so score_jobs.py + cover letters read it.
-async function syncResumeToProfile(profileId: string, content: string): Promise<void> {
-  await sb(`agent_profile?id=eq.${profileId}`, {
-    method: "PATCH",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ resume_text: content, updated_at: new Date().toISOString() }),
-  });
-}
-
-// Insert a new active version (deactivating the prior active first — only one
-// row may be active per the partial unique index).
-async function pushResumeVersion(content: string, note: string): Promise<number> {
-  const nextNo = await nextResumeVersionNo();
-  await sb("resume_versions?is_active=eq.true", {
-    method: "PATCH",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ is_active: false }),
-  });
-  await sb("resume_versions", {
-    method: "POST",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ version_no: nextNo, content, note, is_active: true }),
-  });
-  return nextNo;
-}
-
-// Make an existing version active again (revert). Returns its content or null.
-async function activateResumeVersion(versionNo: number): Promise<string | null> {
-  const rows = await sb(`resume_versions?select=content&version_no=eq.${versionNo}&limit=1`);
-  if (!rows?.length) return null;
-  await sb("resume_versions?is_active=eq.true", {
-    method: "PATCH",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ is_active: false }),
-  });
-  await sb(`resume_versions?version_no=eq.${versionNo}`, {
-    method: "PATCH",
-    headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ is_active: true }),
-  });
-  return rows[0].content;
 }
 
 async function getAsset(key: string): Promise<string> {
@@ -404,19 +350,19 @@ const HELP = [
   "• <b>Cover letter</b> — “write a cover letter for the ShipBob role”, then “make it tighter” / “lead with the bilingual angle”",
   "• <b>Edit your profile</b> — “add ‘no on-call’ to my dealbreakers”",
   "• <b>Feedback</b> — “stop showing me teaching jobs”",
-  "• <b>Resume</b> — “show my resume”, “list resume versions”, “update my resume: add a bullet about X”, “revert resume to v1”",
+  "• <b>Resume</b> (read-only) — “show my resume”, “list resume versions”. Resume edits happen in Claude Code, not here.",
   "• <b>/rubric</b> — view + edit what the scout looks for",
   "• <b>/cost</b> — LLM spend (today / 7d / 30d / all)",
   "",
   "Your full digest still comes by email each morning.",
 ].join("\n");
 
-const ROUTER_SYSTEM = `You are the Job Scout assistant for Otis, a job seeker, chatting with him in Telegram. You can answer questions about his job matches, kick off cover letters, edit his search profile, record feedback, and manage his version-controlled resume (view / push a new version / revert). You have his PROFILE and RECENT MATCHING JOBS (in this system message) plus the recent conversation (prior turns). Use the conversation for context — if he says "make it tighter" or "that one", resolve it from the history.
+const ROUTER_SYSTEM = `You are the Job Scout assistant for Otis, a job seeker, chatting with him in Telegram. You can answer questions about his job matches, kick off cover letters, edit his search profile, record feedback, and let him READ his version-controlled resume (read-only — resume edits happen in Claude Code, never here). You have his PROFILE and RECENT MATCHING JOBS (in this system message) plus the recent conversation (prior turns). Use the conversation for context — if he says "make it tighter" or "that one", resolve it from the history.
 
 Reply ONLY with a JSON object:
 {
   "reply": "<message to Otis in plain text + Markdown only (**bold**, *italic*, - bullets). NO HTML tags.>",
-  "action": "none" | "lookup_job" | "cover_letter" | "update_profile" | "feedback" | "resume_view" | "resume_update" | "resume_activate",
+  "action": "none" | "lookup_job" | "cover_letter" | "update_profile" | "feedback" | "resume_view",
   "args": { }
 }
 
@@ -425,14 +371,13 @@ Rules:
 - General knowledge (what is X platform/tool/company, industry questions, "can I use Claude Code with Y", career advice): action="none", answer DIRECTLY from your own knowledge. You are NOT limited to the job list for general questions.
 - A SPECIFIC job or company that may NOT be in RECENT MATCHING JOBS (e.g. "the zingtree job", "tell me about the Acme role"): action="lookup_job", args={"job_hint":"<company or ONE distinctive word, e.g. 'zingtree'>", "question":"<exactly what he is asking>"}. reply = one short line like "Looking that up.".
 - Cover letter (new OR a revision of one already in the conversation): action="cover_letter", args={"job_hint":"<JUST the company name or one distinctive title word — e.g. 'ShipBob', NOT 'the ShipBob role'; reuse the same job if revising>", "instruction":"<what he wants, e.g. 'tighter', 'lead with bilingual', or 'standard'>"}. One short line in reply like "On it.".
-- Edit profile / scoring brain: action="update_profile", args={"field":"<target_roles|skills|job_types|location_preference|zip_code|salary_notes|custom_prompt>", "value": <COMPLETE new value; for arrays return the full updated array>}. Confirm in reply.
-- Record a dislike that should affect scoring: action="feedback", args={"note":"<short rule>"}. Confirm in reply.
-- READ his resume (display only, makes NO change): action="resume_view", args={"which":"active"|"list"|"<version number>"}. Use ONLY for pure read verbs — "show / see / read / view / display / pull up my resume" -> "active"; "list resume versions" / "resume history" -> "list"; "show resume v2" -> "2". reply = one short line (the resume text is attached by the system). If he wants to CHANGE the resume in ANY way, it is NOT resume_view — use resume_update.
-- CHANGE his resume = push a NEW version (ONLY on a direct command to change it). Trigger verbs aimed at the resume: "update / add ... to / change / edit / put ... on / remove ... from / reword / rewrite / tweak my resume", OR he pastes a resume and says save it. Examples that ARE resume_update: "update my resume to add X", "add a bullet to my resume about Y", "change my title on my resume", "save this as my resume", "push a new resume version". action="resume_update", args={"note":"<8 words max summarizing the change>"}. Do NOT copy the resume text into args — the system reads his full message directly. reply = one short line like "Updating your resume.". CARVE-OUT: if he is only ASKING YOUR OPINION or floating an idea rather than commanding — "what do you think about adding X", "should I add X", "would it help to...", "can you review/suggest/consider..." — that is NOT a command: use action="none" and give analysis only (do not push a version).
-- Revert / activate an existing resume version: action="resume_activate", args={"version_no": <number>}. e.g. "revert my resume to v1", "make resume v2 active".
+- Edit profile / scoring brain — ONLY when he names a specific field to SET and gives the new value (e.g. "add Solutions Engineer to my target roles", "set my salary floor to 6k", "change my location to remote-only", "add Python to my skills"): action="update_profile", args={"field":"<target_roles|skills|job_types|location_preference|zip_code|salary_notes|custom_prompt>", "value": <COMPLETE new value; for arrays return the full updated array>}. Confirm in reply.
+- Record a DISLIKE / exclusion / scoring preference that is NOT a specific field edit — "stop showing me X jobs", "don't show me Y", "I don't want Z", "avoid roles that...", "stop ranking W so high", "no more commission-only": action="feedback", args={"note":"<short rule>"}. Confirm in reply. TIEBREAKER: for ANY "stop / don't / avoid / no more / quit showing ..." phrasing, choose feedback, NOT update_profile.
+- READ his resume (display only — the bot is READ-ONLY for the resume): action="resume_view", args={"which":"active"|"list"|"<version number>"}. "show / see / read / view / display / pull up my resume" -> "active"; "list resume versions" / "resume history" -> "list"; "show resume v2" -> "2". reply = one short line (the resume text is attached by the system).
+- The bot CANNOT change the resume. If he asks to edit / update / add to / rewrite / replace his resume (or his PDF), action="none" and tell him resume edits are done in Claude Code, not here — offer to show the current one instead.
 - Never invent jobs not in the data.
-- REVIEW-ONLY: if Otis asks you to review, propose, suggest, think about, or consider changes (including resume edits) WITHOUT explicitly telling you to apply/save/make/do them, use action="none" and give your analysis only. Do NOT update_profile, feedback, resume_update, or resume_activate until he clearly says to apply it (e.g. "do it", "apply that", "go ahead", "save it"). resume_view is read-only and always allowed.
-- NEVER claim you updated, saved, changed, or adjusted his profile/settings/rubric/resume unless action is update_profile, feedback, resume_update, or resume_activate. With action="none" you must not say you changed anything — only answer or give analysis.`;
+- REVIEW-ONLY: if Otis asks you to review, propose, suggest, think about, or consider changes WITHOUT explicitly telling you to apply/save/make/do them, use action="none" and give your analysis only. Do NOT update_profile or feedback until he clearly says to apply it (e.g. "do it", "apply that", "go ahead", "save it"). resume_view is read-only and always allowed.
+- NEVER claim you updated, saved, changed, or adjusted his profile/settings/rubric unless action is update_profile or feedback. With action="none" you must not say you changed anything — only answer or give analysis.`;
 
 Deno.serve(async (req: Request): Promise<Response> => {
   const cfg = getConfig();
@@ -587,7 +532,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
           `${v.is_active ? "✅" : "  "} <b>v${v.version_no}</b> · ${String(v.created_at).slice(0, 10)}` +
           (v.note ? ` · ${esc(v.note)}` : ""));
         out = "🗂 <b>Resume versions</b>\n" + (lines.join("\n") || "(none yet)") +
-          "\n\nSay “show resume v2” to read one, or “revert resume to v1” to roll back.";
+          "\n\nSay “show resume v2” to read any version. New versions + edits are done in Claude Code, not here.";
       } else {
         const rows = /^\d+$/.test(which)
           ? await sb(`resume_versions?select=content,version_no,note,is_active,created_at&version_no=eq.${which}&limit=1`)
@@ -597,42 +542,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
           ? `📄 <b>Resume v${row.version_no}</b>${row.is_active ? " (active)" : ""}` +
             (row.note ? ` · ${esc(row.note)}` : "") + "\n\n" + esc(String(row.content))
           : "No such resume version. Say “list resume versions” to see what exists.";
-      }
-    } else if (action === "resume_update") {
-      const note = String(args.note || "resume update").slice(0, 200);
-      const active = await getActiveResume();
-      const cur = active?.content || (await getResumeText());
-      const newContent = (await callLLM(orKey, {
-        model: MODEL_LETTER,
-        system:
-          "You maintain Otis's professional resume as clean plain text (ATS-friendly, no markdown fences, no commentary). You are given the CURRENT resume and a message from Otis. If his message contains a full replacement resume, adopt it as the new resume (cleaned to plain text). If it is an edit instruction (add / remove / reword / reorder a section or bullet; change a title, date, or metric), apply it to the current resume and keep everything else intact. Return ONLY the COMPLETE updated resume as plain text. Stay strictly faithful to the facts — never invent employers, titles, dates, or experience.",
-        user: `CURRENT RESUME:\n${cur}\n\n=== OTIS'S MESSAGE ===\n${text}`,
-        maxTokens: 2000,
-        source: "bot_resume_update",
-      })).trim();
-      if (!newContent || newContent.length < 200) {
-        out = "⚠️ I couldn't produce a clean updated resume from that. Paste the full text, or give me a clearer edit.";
-      } else {
-        const nextNo = await pushResumeVersion(newContent, note);
-        await syncResumeToProfile(profile.id, newContent);
-        const prevNo = active?.version_no;
-        out = `✅ Pushed <b>resume v${nextNo}</b> (now active) — ${esc(note)}.\n` +
-          "Live for scoring + cover letters. Say “show my resume” to read it" +
-          (prevNo ? `, or “revert resume to v${prevNo}” to roll back` : "") + ".\n\n" +
-          `<b>Preview:</b>\n${esc(newContent.slice(0, 900))}${newContent.length > 900 ? "…" : ""}`;
-      }
-    } else if (action === "resume_activate") {
-      const vno = parseInt(String(args.version_no ?? "").replace(/^v/i, ""), 10);
-      if (!vno) {
-        out = "Which version number should I activate? e.g. “revert resume to v1”.";
-      } else {
-        const content = await activateResumeVersion(vno);
-        if (!content) {
-          out = `No resume version v${vno} found. Say “list resume versions” to see what exists.`;
-        } else {
-          await syncResumeToProfile(profile.id, content);
-          out = `✅ Resume <b>v${vno}</b> is now active and live for scoring + cover letters.`;
-        }
       }
     }
 
