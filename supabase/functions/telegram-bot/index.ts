@@ -104,8 +104,10 @@ async function findJob(hint: string): Promise<any | null> {
   for (const t of tries) {
     if (!t) continue;
     const enc = encodeURIComponent(`*${t}*`);
+    // match title, company, OR description — tools like "zingtree" often live
+    // only in the body, not the title/company.
     const rows = await sb(
-      `jobs?select=${cols}&is_active=eq.true&or=(job_title.ilike.${enc},company.ilike.${enc})` +
+      `jobs?select=${cols}&is_active=eq.true&or=(job_title.ilike.${enc},company.ilike.${enc},description.ilike.${enc})` +
         `&order=resume_score.desc&limit=1`,
     );
     if (rows?.length) return rows[0];
@@ -338,12 +340,14 @@ const ROUTER_SYSTEM = `You are the Job Scout assistant for Otis, a job seeker, c
 Reply ONLY with a JSON object:
 {
   "reply": "<message to Otis in plain text + Markdown only (**bold**, *italic*, - bullets). NO HTML tags.>",
-  "action": "none" | "cover_letter" | "update_profile" | "feedback",
+  "action": "none" | "lookup_job" | "cover_letter" | "update_profile" | "feedback",
   "args": { }
 }
 
 Rules:
-- Q&A / listing jobs: action="none", answer in "reply" from RECENT MATCHING JOBS. Scores are 0-100; show score/10. ALWAYS include each job's "posted" field (e.g. "posted 3 days ago"). One job per line: "**Title** — Company · score/10 · posted X days ago".
+- Listing his matches / anything answerable from RECENT MATCHING JOBS: action="none", answer in "reply". Scores are 0-100; show score/10. ALWAYS include each job's "posted" field (e.g. "posted 3 days ago"). One job per line: "**Title** — Company · score/10 · posted X days ago".
+- General knowledge (what is X platform/tool/company, industry questions, "can I use Claude Code with Y", career advice): action="none", answer DIRECTLY from your own knowledge. You are NOT limited to the job list for general questions.
+- A SPECIFIC job or company that may NOT be in RECENT MATCHING JOBS (e.g. "the zingtree job", "tell me about the Acme role"): action="lookup_job", args={"job_hint":"<company or ONE distinctive word, e.g. 'zingtree'>", "question":"<exactly what he is asking>"}. reply = one short line like "Looking that up.".
 - Cover letter (new OR a revision of one already in the conversation): action="cover_letter", args={"job_hint":"<JUST the company name or one distinctive title word — e.g. 'ShipBob', NOT 'the ShipBob role'; reuse the same job if revising>", "instruction":"<what he wants, e.g. 'tighter', 'lead with bilingual', or 'standard'>"}. One short line in reply like "On it.".
 - Edit profile / scoring brain: action="update_profile", args={"field":"<target_roles|skills|job_types|location_preference|zip_code|salary_notes|custom_prompt>", "value": <COMPLETE new value; for arrays return the full updated array>}. Confirm in reply.
 - Record a dislike that should affect scoring: action="feedback", args={"note":"<short rule>"}. Confirm in reply.
@@ -406,17 +410,50 @@ Deno.serve(async (req: Request): Promise<Response> => {
       `\n\n=== PROFILE ===\n${JSON.stringify(profile)}` +
       `\n\n=== RECENT MATCHING JOBS ===\n${JSON.stringify(jobs)}`;
 
-    const routed = parseJson(
-      await callLLM(orKey, {
-        model: MODEL, system: routerSystem, user: text, history,
-        json: true, maxTokens: 900, source: "bot_router",
-      }),
-    );
+    const rawRouted = await callLLM(orKey, {
+      model: MODEL, system: routerSystem, user: text, history,
+      json: true, maxTokens: 1200, source: "bot_router",
+    });
+    // If the router didn't return clean JSON (truncation, prose), don't error —
+    // fall back to treating the raw text as a plain answer.
+    let routed: any;
+    try {
+      routed = parseJson(rawRouted);
+    } catch {
+      console.error("router parse failed; raw:", rawRouted.slice(0, 400));
+      // Salvage the "reply" field if present, else strip any trailing JSON fragment.
+      const mr = rawRouted.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      let salvaged = "";
+      if (mr) { try { salvaged = JSON.parse('"' + mr[1] + '"'); } catch { salvaged = mr[1]; } }
+      if (!salvaged) salvaged = rawRouted.replace(/\{[\s\S]*$/, "").trim();
+      routed = { action: "none", reply: salvaged || "Sorry, I blanked on that — try again." };
+    }
     const action = routed.action || "none";
     const args = routed.args || {};
     let out = mdToHtml(routed.reply || "");
 
-    if (action === "cover_letter") {
+    if (action === "lookup_job") {
+      // Search ALL active jobs (not just the top matches) for a specific listing,
+      // then answer his question grounded in it (or from general knowledge if missing).
+      const hint = String(args.job_hint || "").trim();
+      const question = String(args.question || text);
+      const job = hint ? await findJob(hint) : null;
+      const jobBlock = job
+        ? `JOB: ${job.job_title} at ${job.company}\nLocation: ${job.location || "?"}\nScore: ${job.resume_score ?? "?"}/100\n\nDESCRIPTION:\n${(job.description || "").slice(0, 5000)}`
+        : `(No job matching "${hint}" was found in the scraped listings — it may have aged out or scored low. Answer from general knowledge and say it wasn't in his current listings.)`;
+      const ans = await callLLM(orKey, {
+        model: MODEL,
+        system: "You are Otis's job-scout assistant. Answer his question about the job/platform concisely in plain text + light Markdown (**bold**, - bullets). Otis works almost entirely through Claude Code (AI-assisted automation and dev) and cares whether a role lets him leverage it — call that out when relevant. Ground your answer in the job data if provided; otherwise use general knowledge.",
+        user: `${jobBlock}\n\nOtis asks: ${question}`,
+        maxTokens: 700,
+        source: "bot_lookup",
+      });
+      const head = job
+        ? `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}` +
+          (job.resume_score != null ? ` · ${Math.round(job.resume_score / 10)}/10` : "") + "\n\n"
+        : "";
+      out = head + mdToHtml(ans);
+    } else if (action === "cover_letter") {
       const [asset, resume] = await Promise.all([getAsset("cover_letter_system"), getResumeText()]);
       const hint = String(args.job_hint || "").trim();
       const job = hint ? await findJob(hint) : null;
@@ -469,7 +506,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
     await saveTurn(chatKey, "assistant", out);
   } catch (e) {
     console.error("handler error", e);
-    await reply(token, chatId, "⚠️ Hit an error handling that. Try rephrasing, or ask again in a moment.");
+    const detail = esc(String((e as any)?.message || e)).slice(0, 350);
+    await reply(token, chatId, `⚠️ Hit an error handling that. Try again in a moment.\n\n<code>${detail}</code>`);
   }
 
   return new Response("ok");
