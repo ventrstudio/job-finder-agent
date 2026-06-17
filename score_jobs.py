@@ -46,7 +46,10 @@ def build_scoring_prompt(job: dict, profile: dict) -> str:
     skills = profile.get("skills", [])
     job_types = profile.get("job_types", [])
     location_pref = profile.get("location_preference", "")
-    anti_patterns = profile.get("anti_patterns", "")
+    anti_patterns = profile.get("anti_patterns") or ""
+    # anti_patterns is a text[] column — render the list as bullet lines for the prompt
+    if isinstance(anti_patterns, list):
+        anti_patterns = "\n".join(f"- {a}" for a in anti_patterns if a)
     custom_prompt = profile.get("custom_prompt", "")
 
     prompt = f"""## CANDIDATE PROFILE
@@ -60,7 +63,7 @@ def build_scoring_prompt(job: dict, profile: dict) -> str:
 {resume_text[:3000] if resume_text else 'Not available'}
 
 **Positive Signal Keywords (boost score):**
-n8n, Make, Zapier, automation platforms, AI, LLM, Claude, OpenAI, GPT, Gemini, AI integration, AI implementation, Supabase, Airtable, Firebase, PostgreSQL, React, Next.js, Framer, web development, API integration, webhook, workflow automation, no-code, low-code, citizen developer, MCP, Model Context Protocol, AI agents, Cursor, Claude Code, AI-assisted development, CRM, process optimization, digital transformation, UI/UX, design systems, frontend development
+n8n, Make, Zapier, automation platforms, AI, LLM, Claude, OpenAI, GPT, Gemini, AI integration, AI implementation, Supabase, Airtable, Firebase, PostgreSQL, React, Next.js, Tailwind, web development, API integration, webhook, workflow automation, no-code, low-code, citizen developer, MCP, Model Context Protocol, AI agents, Cursor, Claude Code, AI-assisted development, CRM, process optimization, digital transformation, UI/UX, design systems, frontend development
 
 **Automatic Dealbreakers (score 1-2) — only when this is the CORE of the role, not an incidental mention:**
 - Strictly requires a CS degree with no "or equivalent experience" path
@@ -134,8 +137,6 @@ If the description doesn't mention time zone requirements at all, assume flexibl
 {job.get('description', 'No description available')[:4000]}
 
 ---
-
-CRITICAL RULE: If Job Type is "fulltime" and the description does NOT explicitly mention part-time flexibility, reduced hours, or contract options, the score MUST be 4/10 or lower regardless of other fit factors. The candidate cannot take full-time work.
 
 Score this job. Return only the JSON object."""
 

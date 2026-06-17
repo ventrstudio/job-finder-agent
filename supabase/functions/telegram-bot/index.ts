@@ -287,6 +287,39 @@ function esc(s: string): string {
   return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// Convert LLM Markdown into the small HTML subset Telegram renders.
+// Handles fenced code, inline code, **bold**, *italic*, ~~strike~~, # headers,
+// - bullets, and [text](url). Escapes all other </>/& so prose can't break parsing.
+function mdToHtml(raw: string): string {
+  let s = String(raw ?? "");
+  // 1) pull fenced code blocks out so their contents aren't touched
+  const blocks: string[] = [];
+  s = s.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, (_m, code) => {
+    blocks.push(String(code).replace(/\n$/, ""));
+    return `@B${blocks.length - 1}@`;
+  });
+  // 2) escape HTML specials (markdown tokens are not specials, so they survive)
+  s = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // 3) line-level: headers -> bold, bullet markers -> •
+  s = s.split("\n").map((ln) => {
+    const h = ln.match(/^\s*#{1,6}\s+(.*)$/);
+    if (h) return `<b>${h[1].trim()}</b>`;
+    const b = ln.match(/^(\s*)[-*+]\s+(.*)$/);
+    if (b) return `${b[1]}• ${b[2]}`;
+    return ln;
+  }).join("\n");
+  // 4) inline code, then bold, then single-* italic (underscores left alone to
+  //    avoid eating snake_case), then strike, then links
+  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<i>$2</i>");
+  s = s.replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>');
+  // 5) restore code blocks (escaped)
+  s = s.replace(/@B(\d+)@/g, (_m, i) => `<pre>${esc(blocks[Number(i)])}</pre>`);
+  return s;
+}
+
 const HELP = [
   "🔍 <b>Job Scout</b> — I’m your job assistant. Talk to me normally, I remember the last few messages:",
   "",
@@ -304,13 +337,13 @@ const ROUTER_SYSTEM = `You are the Job Scout assistant for Otis, a job seeker, c
 
 Reply ONLY with a JSON object:
 {
-  "reply": "<message to Otis, plain text or light HTML (<b>,<i>)>",
+  "reply": "<message to Otis in plain text + Markdown only (**bold**, *italic*, - bullets). NO HTML tags.>",
   "action": "none" | "cover_letter" | "update_profile" | "feedback",
   "args": { }
 }
 
 Rules:
-- Q&A / listing jobs: action="none", answer in "reply" from RECENT MATCHING JOBS. Scores are 0-100; show score/10. ALWAYS include each job's "posted" field (e.g. "posted 3 days ago"). One job per line: "<b>Title</b> — Company · score/10 · posted X days ago".
+- Q&A / listing jobs: action="none", answer in "reply" from RECENT MATCHING JOBS. Scores are 0-100; show score/10. ALWAYS include each job's "posted" field (e.g. "posted 3 days ago"). One job per line: "**Title** — Company · score/10 · posted X days ago".
 - Cover letter (new OR a revision of one already in the conversation): action="cover_letter", args={"job_hint":"<JUST the company name or one distinctive title word — e.g. 'ShipBob', NOT 'the ShipBob role'; reuse the same job if revising>", "instruction":"<what he wants, e.g. 'tighter', 'lead with bilingual', or 'standard'>"}. One short line in reply like "On it.".
 - Edit profile / scoring brain: action="update_profile", args={"field":"<target_roles|skills|job_types|location_preference|zip_code|salary_notes|custom_prompt>", "value": <COMPLETE new value; for arrays return the full updated array>}. Confirm in reply.
 - Record a dislike that should affect scoring: action="feedback", args={"note":"<short rule>"}. Confirm in reply.
@@ -381,7 +414,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     );
     const action = routed.action || "none";
     const args = routed.args || {};
-    let out = routed.reply || "";
+    let out = mdToHtml(routed.reply || "");
 
     if (action === "cover_letter") {
       const [asset, resume] = await Promise.all([getAsset("cover_letter_system"), getResumeText()]);
@@ -402,7 +435,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       });
       const age = job ? agePosted(job.date_posted) : null;
       out = (job ? `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}\n` + (age ? `🗓 ${esc(age)}\n` : "") +
-        (job.job_url_direct ? `${esc(job.job_url_direct)}\n` : "") + "\n" : "") + esc(letter);
+        (job.job_url_direct ? `${esc(job.job_url_direct)}\n` : "") + "\n" : "") + mdToHtml(letter);
     } else if (action === "update_profile") {
       const field = String(args.field || "");
       const allowedFields = [
