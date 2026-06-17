@@ -187,20 +187,28 @@ async function callLLM(key: string, o: CallOpts): Promise<string> {
   };
   if (o.json) body.response_format = { type: "json_object" };
 
-  const r = await fetch(OPENROUTER_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://ventr.studio",
-      "X-Title": "VENTR Job Scout Bot",
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await r.json();
-  if (!r.ok) throw new Error(`OpenRouter ${r.status}: ${JSON.stringify(data).slice(0, 300)}`);
-  await logCost(o.source || "bot_router", data?.model || o.model || MODEL, data?.usage);
-  return (data?.choices?.[0]?.message?.content || "").trim();
+  // flash-lite intermittently returns an empty completion under JSON mode —
+  // retry once on empty before giving up.
+  let content = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://ventr.studio",
+        "X-Title": "VENTR Job Scout Bot",
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(`OpenRouter ${r.status}: ${JSON.stringify(data).slice(0, 300)}`);
+    await logCost(o.source || "bot_router", data?.model || o.model || MODEL, data?.usage);
+    content = (data?.choices?.[0]?.message?.content || "").trim();
+    if (content) break;
+    console.error(`empty LLM content (attempt ${attempt + 1}) source=${o.source}`);
+  }
+  return content;
 }
 
 async function costSummary(): Promise<string> {
