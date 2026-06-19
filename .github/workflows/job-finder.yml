@@ -43,6 +43,8 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           EMAILIT_API_KEY: ${{ secrets.EMAILIT_API_KEY }}
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}

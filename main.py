@@ -21,6 +21,7 @@ import config
 import cost_tracker
 import supabase_utils
 import scraper
+import alert_ingest
 from score_jobs import score_unscored_jobs
 from send_digest import send_digest, send_alert
 from telegram_notify import send_telegram_nudge, send_telegram_alert
@@ -69,6 +70,26 @@ def run_pipeline():
                 f"{scraper.LAST_SCRAPE_ERROR}\n\n"
                 "Nothing new entered the pipeline today. A fix is needed.",
             )
+
+        # Step 1b: ingest Indeed job-alert emails (the cheap "breadth" layer —
+        # catches exact-fit roles the narrow scrape queries miss). Deduped on
+        # job_id, so it never re-fetches a job the scrape already pulled.
+        logging.info("\n--- STEP 1b: Ingesting Indeed alert emails ---")
+        try:
+            alert_jobs = alert_ingest.ingest_alert_jobs()
+            if alert_jobs:
+                in_batch = {j["job_id"] for j in new_jobs}
+                added = [j for j in alert_jobs if j["job_id"] not in in_batch]
+                new_jobs = new_jobs + added
+                logging.info(f"Alert ingestion added {len(added)} new jobs "
+                             f"(deduped {len(alert_jobs) - len(added)} already in this run)")
+            if alert_ingest.LAST_INGEST_ERROR:
+                send_telegram_alert(
+                    "Job Scout: alert ingest failed",
+                    f"Indeed alert-email ingestion hit an error:\n\n{alert_ingest.LAST_INGEST_ERROR}",
+                )
+        except Exception as e:
+            logging.error(f"Alert ingestion crashed (non-fatal): {e}", exc_info=True)
 
     # Step 2: Save new jobs to Supabase
     if new_jobs:
