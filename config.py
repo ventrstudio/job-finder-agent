@@ -23,13 +23,29 @@ HEALTHCHECK_URL: str = os.environ.get("HEALTHCHECK_URL", "")
 # 2. SEARCH CONFIGURATION
 # =================================================================
 
-# Target roles to search for (from agent_profile)
+# Target roles to search for (from agent_profile).
+# NOTE: each string is one Indeed keyword search. Indeed ranks by relevance, and
+# we only take the newest N per query (APIFY_MAX_ROWS_PER_QUERY) inside a short
+# recency window — so a NARROW query can miss a perfect role that ranks low for
+# it. Keep a few BROAD nets ("automation specialist", "AI engineer") plus the
+# bullseye literal "Claude Code" (high signal, almost nobody else searches it).
+# A 10/10 Claude-Code role (Redfish, 06-2026) was missed because none of the old
+# 8 narrow queries surfaced it; these broader nets are the fix.
 SEARCH_QUERIES = [
+    # bullseye / high-signal
+    "Claude Code",
+    "Claude AI automation",
     "AI automation engineer",
-    "workflow automation developer",
-    "n8n Make Zapier developer",
-    "no-code automation specialist",
+    "AI engineer",
+    "AI implementation specialist",
     "AI integration developer",
+    # broad automation nets (these catch the relevance-ranked long tail)
+    "automation specialist",
+    "workflow automation developer",
+    "operations automation",
+    "no-code automation specialist",
+    "n8n Make Zapier developer",
+    # dev / web
     "React developer contract remote",
     "Supabase developer",
     "freelance web developer AI",
@@ -46,10 +62,10 @@ COMPANY_BLOCKLIST = [
 APIFY_ACTOR_ID = "borderline/indeed-scraper"
 APIFY_COUNTRY = "us"
 APIFY_JOB_TYPES = ["fulltime", "contract", "parttime"]  # Indeed jt() filter values
-APIFY_FROM_DAYS = "1"  # last 24 hours
+APIFY_FROM_DAYS = "3"  # last 3 days — was 1; a job missed on day-1 (cap/relevance) gets more shots. Dedup collapses repeats.
 APIFY_SORT = "date"  # newest first
-APIFY_MAX_ROWS_PER_QUERY = 15  # per Indeed search URL
-APIFY_MAX_ROWS_GLOBAL = 150  # hard ceiling per run (cost cap)
+APIFY_MAX_ROWS_PER_QUERY = 25  # per Indeed search URL — was 15; deeper so a good role ranked low for a query still gets pulled
+APIFY_MAX_ROWS_GLOBAL = 300  # hard ceiling per run (cost cap) — was 150; raised to give the added queries room
 
 # Local search — on-site/hybrid jobs near home base. Each query runs twice:
 # once nationwide-remote, once location-bound to this area.
@@ -64,7 +80,7 @@ APIFY_LOCAL_RADIUS = "50"  # miles — covers the Treasure Coast + north Palm Be
 # scoring nuance ever feels off.
 SCORING_MODEL = "google/gemini-2.5-flash-lite"
 SCORING_THRESHOLD = 5  # minimum score to include in digest (out of 10)
-JOBS_TO_SCORE_PER_RUN = 150  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
+JOBS_TO_SCORE_PER_RUN = 300  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
 
 # =================================================================
 # 4. DELIVERY CONFIGURATION
