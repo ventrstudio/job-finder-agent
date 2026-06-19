@@ -107,23 +107,54 @@ async function getRecentMatches(limit = 12): Promise<any[]> {
   return rows;
 }
 
+// Generic words that match too many unrelated listings. A lone generic word was
+// pulling a RANDOM high-scored job (e.g. "production" -> a 90-scored unrelated
+// role with its own URL). Never use one as a standalone lookup key.
+const FINDJOB_STOP = new Set([
+  "role", "job", "position", "posting", "listing", "the", "for", "at", "a", "an", "cover", "letter", "one",
+  "software", "engineer", "developer", "developers", "ai", "automation", "specialist", "senior", "staff",
+  "lead", "principal", "remote", "hybrid", "onsite", "production", "productions", "company", "llc", "inc",
+  "technologies", "solutions", "services", "team", "manager", "fulltime", "parttime", "contract", "about",
+]);
+
 async function findJob(hint: string): Promise<any | null> {
   const cols = "job_title,company,location,description,job_url_direct,date_posted,resume_score";
-  // Try the whole hint first, then distinctive words (drop filler), matching
-  // either title or company. Picks the highest-scored hit.
-  const stop = new Set(["role", "job", "position", "posting", "listing", "the", "for", "at", "a", "an", "cover", "letter", "one"]);
-  const words = hint.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3 && !stop.has(w));
-  const tries = [hint.trim(), ...words];
-  for (const t of tries) {
-    if (!t) continue;
-    const enc = encodeURIComponent(`*${t}*`);
-    // match title, company, OR description — tools like "zingtree" often live
-    // only in the body, not the title/company.
+  const full = hint.trim();
+  // Distinctive single words only: length >= 4 and not in the generic stoplist.
+  const words = full.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 4 && !FINDJOB_STOP.has(w));
+  // 1) The full hint phrase — matched against title/company/description (a
+  //    distinctive multi-word hint like a real company name is safe in the body,
+  //    so "the zingtree job" still resolves via the description).
+  // 2) Fallback distinctive words — matched against title/company ONLY, so a
+  //    generic word can never match a random job's description body.
+  const attempts: Array<{ q: string; body: boolean }> = [];
+  if (full) attempts.push({ q: full, body: true });
+  for (const w of words) attempts.push({ q: w, body: false });
+  for (const a of attempts) {
+    const enc = encodeURIComponent(`*${a.q}*`);
+    const orClause = a.body
+      ? `or=(job_title.ilike.${enc},company.ilike.${enc},description.ilike.${enc})`
+      : `or=(job_title.ilike.${enc},company.ilike.${enc})`;
     const rows = await sb(
-      `jobs?select=${cols}&is_active=eq.true&or=(job_title.ilike.${enc},company.ilike.${enc},description.ilike.${enc})` +
-        `&order=resume_score.desc&limit=1`,
+      `jobs?select=${cols}&is_active=eq.true&${orClause}&order=resume_score.desc&limit=1`,
     );
     if (rows?.length) return rows[0];
+  }
+  return null;
+}
+
+// Detect a pasted job description (Otis dumps the whole listing into chat). When
+// present, the pasted text IS the job — skip findJob entirely (that was the
+// source of the wrong-job/random-URL replies).
+function pastedJob(text: string): string | null {
+  const t = (text || "").trim();
+  if (t.length >= 600) return t;
+  if (
+    t.length >= 280 &&
+    /responsibilit|requirement|qualification|about (the|us|our)|position summary|what you.?ll do|core competenc|per hour|\$\s?\d|pay:|benefits|compensation|core values/i
+      .test(t)
+  ) {
+    return t;
   }
   return null;
 }
@@ -371,6 +402,7 @@ Rules:
 - General knowledge (what is X platform/tool/company, industry questions, "can I use Claude Code with Y", career advice): action="none", answer DIRECTLY from your own knowledge. You are NOT limited to the job list for general questions.
 - A SPECIFIC job or company that may NOT be in RECENT MATCHING JOBS (e.g. "the zingtree job", "tell me about the Acme role"): action="lookup_job", args={"job_hint":"<company or ONE distinctive word, e.g. 'zingtree'>", "question":"<exactly what he is asking>"}. reply = one short line like "Looking that up.".
 - Cover letter (new OR a revision of one already in the conversation): action="cover_letter", args={"job_hint":"<JUST the company name or one distinctive title word — e.g. 'ShipBob', NOT 'the ShipBob role'; reuse the same job if revising>", "instruction":"<what he wants, e.g. 'tighter', 'lead with bilingual', or 'standard'>"}. One short line in reply like "On it.".
+- PASTED LISTING: if Otis pastes a full/long job description (a wall of listing text) and wants a letter or a question answered, do NOT try to extract a job_hint from it and do NOT match it to his saved listings. Use action="cover_letter" (or "lookup_job" if he's just asking about it) and LEAVE job_hint EMPTY ("") — the system uses the pasted text itself as the job. Reply one short line like "On it.".
 - Edit profile / scoring brain — ONLY when he names a specific field to SET and gives the new value (e.g. "add Solutions Engineer to my target roles", "set my salary floor to 6k", "change my location to remote-only", "add Python to my skills"): action="update_profile", args={"field":"<target_roles|skills|job_types|location_preference|zip_code|salary_notes|custom_prompt>", "value": <COMPLETE new value; for arrays return the full updated array>}. Confirm in reply.
 - Record a DISLIKE / exclusion / scoring preference that is NOT a specific field edit — "stop showing me X jobs", "don't show me Y", "I don't want Z", "avoid roles that...", "stop ranking W so high", "no more commission-only": action="feedback", args={"note":"<short rule>"}. Confirm in reply. TIEBREAKER: for ANY "stop / don't / avoid / no more / quit showing ..." phrasing, choose feedback, NOT update_profile.
 - READ his resume (display only — the bot is READ-ONLY for the resume): action="resume_view", args={"which":"active"|"list"|"<version number>"}. "show / see / read / view / display / pull up my resume" -> "active"; "list resume versions" / "resume history" -> "list"; "show resume v2" -> "2". reply = one short line (the resume text is attached by the system).
@@ -461,10 +493,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
     if (action === "lookup_job") {
       // Search ALL active jobs (not just the top matches) for a specific listing,
       // then answer his question grounded in it (or from general knowledge if missing).
+      const pasted = pastedJob(text);
       const hint = String(args.job_hint || "").trim();
+      const job = pasted ? null : (hint ? await findJob(hint) : null);
       const question = String(args.question || text);
-      const job = hint ? await findJob(hint) : null;
-      const jobBlock = job
+      const jobBlock = pasted
+        ? `JOB (pasted by Otis — answer about THIS listing, do not look one up):\n${pasted.slice(0, 5000)}`
+        : job
         ? `JOB: ${job.job_title} at ${job.company}\nLocation: ${job.location || "?"}\nScore: ${job.resume_score ?? "?"}/100\n\nDESCRIPTION:\n${(job.description || "").slice(0, 5000)}`
         : `(No job matching "${hint}" was found in the scraped listings — it may have aged out or scored low. Answer from general knowledge and say it wasn't in his current listings.)`;
       const ans = await callLLM(orKey, {
@@ -481,9 +516,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
       out = head + mdToHtml(ans);
     } else if (action === "cover_letter") {
       const [asset, resume] = await Promise.all([getAsset("cover_letter_system"), getResumeText()]);
+      const pasted = pastedJob(text);
       const hint = String(args.job_hint || "").trim();
-      const job = hint ? await findJob(hint) : null;
-      const jobBlock = job
+      const job = pasted ? null : (hint ? await findJob(hint) : null);
+      const jobBlock = pasted
+        ? `JOB (pasted by Otis — write the letter for THIS listing, do not look one up):\n${pasted.slice(0, 6000)}`
+        : job
         ? `JOB: ${job.job_title} at ${job.company}\n${job.location || ""}\n\nDESCRIPTION:\n${(job.description || "").slice(0, 6000)}`
         : "(Revise the cover letter already in this conversation — the job is in the history above.)";
       const instruction = String(args.instruction || "standard");
