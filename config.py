@@ -24,31 +24,28 @@ HEALTHCHECK_URL: str = os.environ.get("HEALTHCHECK_URL", "")
 # =================================================================
 
 # Target roles to search for (from agent_profile).
-# NOTE: each string is one Indeed keyword search. Indeed ranks by relevance, and
-# we only take the newest N per query (APIFY_MAX_ROWS_PER_QUERY) inside a short
-# recency window — so a NARROW query can miss a perfect role that ranks low for
-# it. Keep a few BROAD nets ("automation specialist", "AI engineer") plus the
-# bullseye literal "Claude Code" (high signal, almost nobody else searches it).
-# A 10/10 Claude-Code role (Redfish, 06-2026) was missed because none of the old
-# 8 narrow queries surfaced it; these broader nets are the fix.
+# STRATEGY (06-19-2026): PRECISION, not width. Each string is one Indeed keyword
+# search; Indeed ranks by relevance and we take only the newest N per query
+# (APIFY_MAX_ROWS_PER_QUERY) within a short window. So the way to reliably catch
+# an exact-fit role WITHOUT spending more is a NARROW query where that role ranks
+# #1-5 (always survives the cap), not a broad net where it's buried at rank 50.
+# The breadth/long-tail is handled cheaply by the Indeed-alert-email ingestion
+# (alerts already did the matching server-side) — NOT by widening the scrape.
+#
+# A 10/10 role (Redfish, 06-2026, Indeed title "AI Specialist – Claude AI /
+# Claude Code / Cowork") was missed purely because no query searched its words.
+# The literal "Claude Code" query now catches that exact title for ~zero cost
+# (few postings match it). Keep these tight and high-signal.
 SEARCH_QUERIES = [
-    # bullseye / high-signal
-    "Claude Code",
+    "Claude Code",                       # bullseye literal — high signal, ~zero competition
     "Claude AI automation",
     "AI automation engineer",
-    "AI engineer",
-    "AI implementation specialist",
     "AI integration developer",
-    # broad automation nets (these catch the relevance-ranked long tail)
-    "automation specialist",
     "workflow automation developer",
-    "operations automation",
-    "no-code automation specialist",
     "n8n Make Zapier developer",
-    # dev / web
-    "React developer contract remote",
+    "no-code automation specialist",
     "Supabase developer",
-    "freelance web developer AI",
+    "React developer contract remote",
 ]
 
 # Companies to exclude entirely. Case-insensitive substring match against the
@@ -62,10 +59,10 @@ COMPANY_BLOCKLIST = [
 APIFY_ACTOR_ID = "borderline/indeed-scraper"
 APIFY_COUNTRY = "us"
 APIFY_JOB_TYPES = ["fulltime", "contract", "parttime"]  # Indeed jt() filter values
-APIFY_FROM_DAYS = "3"  # last 3 days — was 1; a job missed on day-1 (cap/relevance) gets more shots. Dedup collapses repeats.
+APIFY_FROM_DAYS = "1"  # last 24h. Precision queries catch a role the day it posts; widening this just adds cost. Breadth = alert-email ingestion.
 APIFY_SORT = "date"  # newest first
-APIFY_MAX_ROWS_PER_QUERY = 25  # per Indeed search URL — was 15; deeper so a good role ranked low for a query still gets pulled
-APIFY_MAX_ROWS_GLOBAL = 300  # hard ceiling per run (cost cap) — was 150; raised to give the added queries room
+APIFY_MAX_ROWS_PER_QUERY = 15  # per Indeed search URL — narrow queries rarely exceed this, so the cap doesn't bite
+APIFY_MAX_ROWS_GLOBAL = 150  # hard ceiling per run (cost cap)
 
 # Local search — on-site/hybrid jobs near home base. Each query runs twice:
 # once nationwide-remote, once location-bound to this area.
@@ -80,7 +77,7 @@ APIFY_LOCAL_RADIUS = "50"  # miles — covers the Treasure Coast + north Palm Be
 # scoring nuance ever feels off.
 SCORING_MODEL = "google/gemini-2.5-flash-lite"
 SCORING_THRESHOLD = 5  # minimum score to include in digest (out of 10)
-JOBS_TO_SCORE_PER_RUN = 300  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
+JOBS_TO_SCORE_PER_RUN = 150  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
 
 # =================================================================
 # 4. DELIVERY CONFIGURATION
