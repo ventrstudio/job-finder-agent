@@ -97,6 +97,32 @@ def _score_color(score: int) -> str:
     return "#6b7280"
 
 
+_VERDICT_STYLE = {
+    "AVOID":      ("#991b1b", "#fef2f2", "🛑 AVOID"),
+    "SUSPICIOUS": ("#92400e", "#fffbeb", "⚠️ SUSPICIOUS"),
+    "CAUTION":    ("#92400e", "#fffbeb", "⚠️ CAUTION"),
+    "LEGIT":      ("#166534", "#dcfce7", "✅ Legit"),
+    "UNKNOWN":    ("#374151", "#f3f4f6", "❔ Unverified"),
+}
+
+
+def _render_legitimacy(job: dict) -> str:
+    """Legitimacy verdict banner for the email row (Tier 2)."""
+    verdict = str(job.get("legitimacy_verdict") or "").upper()
+    if not verdict:
+        return ""
+    color, bg, label = _VERDICT_STYLE.get(verdict, _VERDICT_STYLE["UNKNOWN"])
+    summary = job.get("legitimacy_summary") or ""
+    badge = (f'<span style="display:inline-block;background:{bg};color:{color};'
+             f'padding:2px 10px;border-radius:4px;font-weight:700;font-size:12px;">'
+             f'Legitimacy: {label}</span>')
+    if verdict == "LEGIT" or not summary:
+        return f'<div style="margin-top:8px;">{badge}</div>'
+    safe = str(summary).replace("<", "&lt;").replace(">", "&gt;")
+    return (f'<div style="margin-top:8px;">{badge}'
+            f'<div style="margin-top:4px;font-size:12px;color:{color};line-height:1.4;">{safe}</div></div>')
+
+
 def _render_pros_cons(pros: list, cons: list) -> str:
     """Render pros/cons as inline HTML."""
     html = ""
@@ -211,6 +237,8 @@ def build_email_html(scored_jobs: list) -> str:
 
                 {pros_cons_html}
 
+                {_render_legitimacy(job)}
+
                 <div style="margin-top:10px;">{listing_link}</div>
             </td>
         </tr>"""
@@ -256,9 +284,13 @@ def send_digest(scored_jobs: list) -> bool:
         logging.info("No jobs to send in digest. Skipping email.")
         return True
 
-    # Filter to threshold and sort by score descending
+    # Filter to threshold, then sort: AVOID-flagged jobs demoted to the bottom,
+    # otherwise highest score first (label + demote, never hidden).
     qualified_jobs = [j for j in scored_jobs if j.get("score", 0) >= config.SCORING_THRESHOLD]
-    qualified_jobs.sort(key=lambda x: x.get("score", 0), reverse=True)
+    qualified_jobs.sort(
+        key=lambda x: (str(x.get("legitimacy_verdict") or "").upper() == "AVOID",
+                       -int(x.get("score", 0) or 0))
+    )
 
     # Safety net: drop duplicate listings (same job pulled from two search
     # URLs). Sorted score-desc, so the copy kept is the highest-scored one.
