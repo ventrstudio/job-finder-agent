@@ -548,6 +548,130 @@ def get_customized_resume(resume_id: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# --- Legitimacy / Scam Screen Functions ---
+# Tier 1 = cheap heuristics on every job; Tier 2 = cached company reputation
+# verdict from a web search + LLM. See scam_check.py / reputation.py.
+
+def get_unscreened_jobs(limit: int) -> list:
+    """
+    Jobs that haven't been through the Tier 1 heuristic screen yet
+    (screened_at IS NULL). Active jobs only, oldest first.
+    """
+    if limit <= 0:
+        return []
+    try:
+        response = supabase.table(config.SUPABASE_TABLE_NAME)\
+            .select("job_id, job_title, company, description, salary_min, salary_max, salary_interval")\
+            .eq("is_active", True)\
+            .is_("screened_at", None)\
+            .order("scraped_at", desc=False)\
+            .limit(limit)\
+            .execute()
+        return response.data or []
+    except Exception as e:
+        logging.error(f"Error fetching unscreened jobs: {e}")
+        return []
+
+
+def update_job_screen(job_id: str, scam_risk_score: int, flags: list) -> bool:
+    """Store the Tier 1 heuristic result + stamp screened_at."""
+    if not job_id:
+        return False
+    try:
+        supabase.table(config.SUPABASE_TABLE_NAME).update({
+            "scam_risk_score": scam_risk_score,
+            "scam_risk_flags": flags or [],
+            "screened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }).eq("job_id", job_id).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Error updating scam screen for {job_id}: {e}")
+        return False
+
+
+def update_job_legitimacy(job_id: str, verdict: str, summary: str,
+                          flags: list, sources: list) -> bool:
+    """Store the Tier 2 reputation verdict on the job row."""
+    if not job_id:
+        return False
+    try:
+        supabase.table(config.SUPABASE_TABLE_NAME).update({
+            "legitimacy_verdict": verdict,
+            "legitimacy_summary": summary,
+            "legitimacy_flags": flags or [],
+            "legitimacy_sources": sources or [],
+            "reputation_checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }).eq("job_id", job_id).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Error updating legitimacy for {job_id}: {e}")
+        return False
+
+
+def get_company_reputation(normalized_name: str) -> Optional[dict]:
+    """Fetch a cached company reputation row, or None."""
+    if not normalized_name:
+        return None
+    try:
+        response = supabase.table("company_reputation")\
+            .select("*")\
+            .eq("normalized_name", normalized_name)\
+            .limit(1)\
+            .execute()
+        if response.data:
+            return response.data[0]
+        return None
+    except Exception as e:
+        logging.error(f"Error fetching company reputation for {normalized_name}: {e}")
+        return None
+
+
+def reputation_is_fresh(checked_at: Optional[str], max_age_days: int) -> bool:
+    """True if a cached verdict was checked within max_age_days."""
+    if not checked_at:
+        return False
+    try:
+        ts = datetime.datetime.fromisoformat(str(checked_at).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        age = datetime.datetime.now(datetime.timezone.utc) - ts
+        return age.days < max_age_days
+    except Exception:
+        return False
+
+
+def upsert_company_reputation(normalized_name: str, display_name: str,
+                              verdict: str, summary: str, flags: list,
+                              sources: list) -> bool:
+    """
+    Write/refresh an auto-generated reputation verdict. Never overwrites a
+    hand-set (manual_override) row — those are authoritative.
+    """
+    if not normalized_name:
+        return False
+    try:
+        existing = get_company_reputation(normalized_name)
+        if existing and existing.get("manual_override"):
+            return True  # leave the human verdict untouched
+
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        supabase.table("company_reputation").upsert({
+            "normalized_name": normalized_name,
+            "display_name": display_name,
+            "verdict": verdict,
+            "summary": summary,
+            "flags": flags or [],
+            "sources": sources or [],
+            "manual_override": False,
+            "checked_at": now_iso,
+            "updated_at": now_iso,
+        }).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Error upserting company reputation for {normalized_name}: {e}")
+        return False
+
+
 # --- Base Resume Functions ---
 # These functions handle storing and retrieving the user's base resume
 # securely via Supabase, instead of committing sensitive files to the repo.

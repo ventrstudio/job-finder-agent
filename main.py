@@ -22,6 +22,7 @@ import cost_tracker
 import supabase_utils
 import scraper
 import alert_ingest
+import screen
 from score_jobs import score_unscored_jobs
 from send_digest import send_digest, send_alert
 from telegram_notify import send_telegram_nudge, send_telegram_alert
@@ -98,11 +99,27 @@ def run_pipeline():
     else:
         logging.info("\n--- STEP 2: No new jobs to save ---")
 
+    # Step 2.5: Tier 1 legitimacy heuristics on every new job (free, no network).
+    if config.SCREEN_ENABLED:
+        logging.info("\n--- STEP 2.5: Screening new jobs for scam tells (Tier 1) ---")
+        try:
+            screen.run_heuristic_screen()
+        except Exception as e:
+            logging.error(f"Tier 1 screen crashed (non-fatal): {e}", exc_info=True)
+
     # Step 3: Score unscored jobs (allow override via SCORE_LIMIT env)
     score_limit_env = os.environ.get("SCORE_LIMIT", "").strip()
     score_limit = int(score_limit_env) if score_limit_env.isdigit() else None
     logging.info(f"\n--- STEP 3: Scoring unscored jobs (limit={score_limit or config.JOBS_TO_SCORE_PER_RUN}) ---")
     scored_jobs = score_unscored_jobs(limit=score_limit)
+
+    # Step 3.5: Tier 2 reputation check on the digest-bound jobs only (cached + capped).
+    if config.SCREEN_ENABLED and scored_jobs:
+        logging.info("\n--- STEP 3.5: Reputation check on top matches (Tier 2) ---")
+        try:
+            scored_jobs = screen.enrich_with_reputation(scored_jobs)
+        except Exception as e:
+            logging.error(f"Tier 2 reputation check crashed (non-fatal): {e}", exc_info=True)
 
     # Step 4: Email digest (full batch) + one-line Telegram nudge
     logging.info("\n--- STEP 4: Sending email digest + Telegram nudge ---")

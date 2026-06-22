@@ -54,6 +54,7 @@ function getConfig(): Record<string, string> {
     telegram_webhook_secret: Deno.env.get("TELEGRAM_WEBHOOK_SECRET") || "",
     allowed_user_id: Deno.env.get("ALLOWED_USER_ID") || "",
     openrouter_api_key: Deno.env.get("OPENROUTER_API_KEY") || "",
+    apify_token: Deno.env.get("APIFY_TOKEN") || "",
   };
 }
 
@@ -98,7 +99,7 @@ function agePosted(d: string | null): string | null {
 
 async function getRecentMatches(limit = 12): Promise<any[]> {
   const cols =
-    "job_title,company,location,is_remote,job_type,salary_min,salary_max,salary_interval,resume_score,score_tldr,job_url_direct,date_posted";
+    "job_title,company,location,is_remote,job_type,salary_min,salary_max,salary_interval,resume_score,score_tldr,job_url_direct,date_posted,legitimacy_verdict,legitimacy_summary,scam_risk_score";
   const rows: any[] = await sb(
     `jobs?select=${cols}&is_active=eq.true&resume_score=gte.${SCORE_MATCH}` +
       `&order=resume_score.desc,scraped_at.desc&limit=${limit}`,
@@ -118,25 +119,22 @@ const FINDJOB_STOP = new Set([
 ]);
 
 async function findJob(hint: string): Promise<any | null> {
-  const cols = "job_title,company,location,description,job_url_direct,date_posted,resume_score";
+  const cols = "job_title,company,location,description,job_url_direct,date_posted,resume_score,legitimacy_verdict,legitimacy_summary,scam_risk_score";
   const full = hint.trim();
   // Distinctive single words only: length >= 4 and not in the generic stoplist.
   const words = full.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 4 && !FINDJOB_STOP.has(w));
-  // 1) The full hint phrase — matched against title/company/description (a
-  //    distinctive multi-word hint like a real company name is safe in the body,
-  //    so "the zingtree job" still resolves via the description).
-  // 2) Fallback distinctive words — matched against title/company ONLY, so a
-  //    generic word can never match a random job's description body.
-  const attempts: Array<{ q: string; body: boolean }> = [];
-  if (full) attempts.push({ q: full, body: true });
-  for (const w of words) attempts.push({ q: w, body: false });
-  for (const a of attempts) {
-    const enc = encodeURIComponent(`*${a.q}*`);
-    const orClause = a.body
-      ? `or=(job_title.ilike.${enc},company.ilike.${enc},description.ilike.${enc})`
-      : `or=(job_title.ilike.${enc},company.ilike.${enc})`;
+  // Match TITLE/COMPANY ONLY — never the description body. A body match let a
+  // stray word (e.g. "websites" from "Head of Websites") hit a random unrelated
+  // high-scored listing and attach ITS url (the wrong-job bug: an Indeed link
+  // came back as an unrelated cyber-security role). Title/company is the only
+  // trustworthy anchor; a hint that lives only in a body is not worth a guess.
+  const queries: string[] = [];
+  if (full) queries.push(full);
+  for (const w of words) queries.push(w);
+  for (const q of queries) {
+    const enc = encodeURIComponent(`*${q}*`);
     const rows = await sb(
-      `jobs?select=${cols}&is_active=eq.true&${orClause}&order=resume_score.desc&limit=1`,
+      `jobs?select=${cols}&is_active=eq.true&or=(job_title.ilike.${enc},company.ilike.${enc})&order=resume_score.desc&limit=1`,
     );
     if (rows?.length) return rows[0];
   }
@@ -157,6 +155,153 @@ function pastedJob(text: string): string | null {
     return t;
   }
   return null;
+}
+
+// A job-board LINK (Indeed/LinkedIn/etc.). The bot has NO web fetch — it only
+// knows jobs already scraped into the DB. A link to a job we don't have must
+// NEVER silently resolve to a random DB row. When a message carries such a link
+// and Otis did NOT also paste the full listing text, we refuse to guess and ask
+// him to paste the description instead.
+const JOB_URL_RE =
+  /https?:\/\/[^\s]*(indeed\.|linkedin\.com\/jobs|glassdoor\.|ziprecruiter\.|greenhouse\.io|lever\.co|ashbyhq\.|workable\.|wellfound\.|builtin\.|\/viewjob|[?&]jk=)/i;
+function hasJobUrl(text: string): boolean {
+  return JOB_URL_RE.test(text || "");
+}
+
+// Pull an Indeed job key (jk) out of a pasted link. Indeed keys are hex, ~16
+// chars. Handles both `?jk=...`/`&jk=...` and the `/viewjob/<jk>` path form.
+function extractJk(text: string): string | null {
+  const t = text || "";
+  const m = t.match(/[?&]jk=([a-f0-9]{8,24})/i) || t.match(/\/viewjob\/([a-f0-9]{8,24})/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+// Fetch ONE Indeed job by key via the memo23 cheerio actor (single-URL "direct
+// job" scrape; ~$0.008/fetch, returns in seconds). The bot has no other way to
+// open a link — this is the fetch path. Maps memo23's raw Indeed shape into the
+// same job object the cover-letter / lookup branches already expect. Returns
+// null on any failure so callers can fall back to "paste the text".
+async function fetchIndeedJob(jk: string, apifyToken: string): Promise<any | null> {
+  if (!apifyToken) { console.error("APIFY_TOKEN not set — cannot fetch Indeed job"); return null; }
+  const jobUrl = `https://www.indeed.com/viewjob?jk=${jk}`;
+  const endpoint =
+    `https://api.apify.com/v2/acts/memo23~apify-indeed-cheerio-ppr/run-sync-get-dataset-items?token=${apifyToken}`;
+  let data: any;
+  try {
+    const r = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ startUrls: [{ url: jobUrl }], maxJobs: 1 }),
+    });
+    if (!r.ok) { console.error(`apify ${r.status}: ${(await r.text()).slice(0, 200)}`); return null; }
+    data = await r.json();
+  } catch (e) {
+    console.error("apify fetch failed", e);
+    return null;
+  }
+  const it = Array.isArray(data) ? data[0] : null;
+  if (!it || !it.title) return null;
+  if (it.expired === true) return null; // dead listing — treat as not found
+  const company = it.sourceEmployerName || it?.source?.name || it?.employer?.name || "the company";
+  const description = it.jobDescription || it.sanitizedJobDescription || "";
+  const loc = it.location || {};
+  const location =
+    [loc.city, loc.admin1Name, loc.countryCode].filter(Boolean).join(", ") ||
+    (it.isRemote ? "Remote" : "");
+  const jt = Array.isArray(it.jobTypes) && it.jobTypes[0]
+    ? String(it.jobTypes[0].label || "").toLowerCase()
+    : null;
+  let date_posted: string | null = null;
+  if (typeof it.datePublished === "number") {
+    const d = new Date(it.datePublished);
+    if (!isNaN(d.getTime())) date_posted = d.toISOString().slice(0, 10);
+  }
+  return {
+    job_title: it.title,
+    company,
+    location,
+    description,
+    job_type: jt,
+    job_url_direct: jobUrl,
+    date_posted,
+    resume_score: null,
+  };
+}
+
+// Cover-letter generation, shared by the inline path and the Indeed-fetch
+// background path so the voice/caching rules stay identical.
+async function genCoverLetter(
+  orKey: string, jobBlock: string, instruction: string, userText: string,
+  history: Array<{ role: string; content: string }>,
+): Promise<string> {
+  const [asset, resume] = await Promise.all([getAsset("cover_letter_system"), getResumeText()]);
+  return await callLLM(orKey, {
+    model: MODEL_LETTER,
+    system: `${asset}\n\n=== OTIS'S RESUME (for detail; do not contradict the facts above) ===\n${resume.slice(0, 3500)}`,
+    user: `${jobBlock}\n\nINSTRUCTION: ${instruction}\nUser's exact words: ${userText}`,
+    history: history.slice(-6),
+    cacheSystem: true,
+    maxTokens: 900,
+    source: "bot_cover_letter",
+  });
+}
+
+// Q&A about a specific job, shared by the inline and Indeed-fetch paths.
+async function genLookupAnswer(orKey: string, jobBlock: string, question: string): Promise<string> {
+  return await callLLM(orKey, {
+    model: MODEL,
+    system: "You are Otis's job-scout assistant. Answer his question about the job/platform concisely in plain text + light Markdown (**bold**, - bullets). Otis works almost entirely through Claude Code (AI-assisted automation and dev) and cares whether a role lets him leverage it — call that out when relevant. Ground your answer in the job data if provided; otherwise use general knowledge.",
+    user: `${jobBlock}\n\nOtis asks: ${question}`,
+    maxTokens: 700,
+    source: "bot_lookup",
+  });
+}
+
+// ---------- active job (per-chat working context) ----------
+// The job the chat is currently working on. A FETCHED Indeed job lives nowhere
+// else (not in the DB), so without this a follow-up ("make it tighter") had
+// nothing to anchor to and findJob() grabbed a random DB row — the wrong-job
+// revert. We stash the resolved job here and reuse it on revisions instead of
+// searching again.
+async function setActiveJob(chatId: string, job: any, source: string): Promise<void> {
+  try {
+    await sb("bot_active_job", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({ chat_id: chatId, job, source, updated_at: new Date().toISOString() }),
+    });
+  } catch (e) {
+    console.error("setActiveJob failed", e);
+  }
+}
+
+async function getActiveJob(chatId: string): Promise<any | null> {
+  try {
+    const since = new Date(Date.now() - HISTORY_MINUTES * 60000).toISOString();
+    const rows = await sb(
+      `bot_active_job?select=job,updated_at&chat_id=eq.${encodeURIComponent(chatId)}` +
+        `&updated_at=gte.${since}&limit=1`,
+    );
+    return rows?.[0]?.job || null;
+  } catch (e) {
+    console.error("getActiveJob failed", e);
+    return null;
+  }
+}
+
+// Is the router's job_hint actually grounded in what Otis TYPED? The router
+// can't see the fetched/active job, so on a revision it sometimes invents a
+// hint pointing at a random DB role (e.g. it returned "Frontend AI Engineer"
+// when he only said "speak on my behalf"). We only honor a hint — i.e. only
+// switch jobs — when the hint (or all its distinctive words) appears in his
+// message. Otherwise the active job stays put.
+function hintInText(text: string, hint: string): boolean {
+  const t = (text || "").toLowerCase();
+  const h = (hint || "").toLowerCase().trim();
+  if (!h) return false;
+  if (h.length >= 4 && t.includes(h)) return true;
+  const words = h.split(/[^a-z0-9]+/).filter((w) => w.length >= 4 && !FINDJOB_STOP.has(w));
+  return words.length > 0 && words.every((w) => t.includes(w));
 }
 
 // ---------- conversation memory ----------
@@ -401,12 +546,14 @@ Rules:
 - Listing his matches / anything answerable from RECENT MATCHING JOBS: action="none", answer in "reply". Scores are 0-100; show score/10. ALWAYS include each job's "posted" field (e.g. "posted 3 days ago"). One job per line: "**Title** — Company · score/10 · posted X days ago".
 - General knowledge (what is X platform/tool/company, industry questions, "can I use Claude Code with Y", career advice): action="none", answer DIRECTLY from your own knowledge. You are NOT limited to the job list for general questions.
 - A SPECIFIC job or company that may NOT be in RECENT MATCHING JOBS (e.g. "the zingtree job", "tell me about the Acme role"): action="lookup_job", args={"job_hint":"<company or ONE distinctive word, e.g. 'zingtree'>", "question":"<exactly what he is asking>"}. reply = one short line like "Looking that up.".
-- Cover letter (new OR a revision of one already in the conversation): action="cover_letter", args={"job_hint":"<JUST the company name or one distinctive title word — e.g. 'ShipBob', NOT 'the ShipBob role'; reuse the same job if revising>", "instruction":"<what he wants, e.g. 'tighter', 'lead with bilingual', or 'standard'>"}. One short line in reply like "On it.".
+- Cover letter (new OR a revision of one already in the conversation): action="cover_letter", args={"job_hint":"<JUST the company name or one distinctive title word — e.g. 'ShipBob', NOT 'the ShipBob role'>", "instruction":"<what he wants, e.g. 'tighter', 'lead with bilingual', or 'standard'>"}. One short line in reply like "On it.".
+- CRITICAL — REVISIONS: if he is adjusting the letter already in the conversation ("too long", "make it tighter", "more casual", "focus it on web design", "make this my default", any feedback on the current letter), set job_hint to "" (EMPTY) and put the change in instruction. Do NOT put a job name, title word, or anything from his feedback into job_hint. Only set job_hint when he clearly names a DIFFERENT, new job to switch to. When in doubt on a follow-up, leave job_hint empty.
 - PASTED LISTING: if Otis pastes a full/long job description (a wall of listing text) and wants a letter or a question answered, do NOT try to extract a job_hint from it and do NOT match it to his saved listings. Use action="cover_letter" (or "lookup_job" if he's just asking about it) and LEAVE job_hint EMPTY ("") — the system uses the pasted text itself as the job. Reply one short line like "On it.".
 - Edit profile / scoring brain — ONLY when he names a specific field to SET and gives the new value (e.g. "add Solutions Engineer to my target roles", "set my salary floor to 6k", "change my location to remote-only", "add Python to my skills"): action="update_profile", args={"field":"<target_roles|skills|job_types|location_preference|zip_code|salary_notes|custom_prompt>", "value": <COMPLETE new value; for arrays return the full updated array>}. Confirm in reply.
 - Record a DISLIKE / exclusion / scoring preference that is NOT a specific field edit — "stop showing me X jobs", "don't show me Y", "I don't want Z", "avoid roles that...", "stop ranking W so high", "no more commission-only": action="feedback", args={"note":"<short rule>"}. Confirm in reply. TIEBREAKER: for ANY "stop / don't / avoid / no more / quit showing ..." phrasing, choose feedback, NOT update_profile.
 - READ his resume (display only — the bot is READ-ONLY for the resume): action="resume_view", args={"which":"active"|"list"|"<version number>"}. "show / see / read / view / display / pull up my resume" -> "active"; "list resume versions" / "resume history" -> "list"; "show resume v2" -> "2". reply = one short line (the resume text is attached by the system).
 - The bot CANNOT change the resume. If he asks to edit / update / add to / rewrite / replace his resume (or his PDF), action="none" and tell him resume edits are done in Claude Code, not here — offer to show the current one instead.
+- LINKS: if his message contains a job URL and he wants a cover letter or a question answered, route to cover_letter or lookup_job and leave job_hint EMPTY (""). The system fetches Indeed links automatically, and for links it can't open it asks him to paste the text — either way, NEVER guess a job_hint from a URL or the words around it.
 - Never invent jobs not in the data.
 - REVIEW-ONLY: if Otis asks you to review, propose, suggest, think about, or consider changes WITHOUT explicitly telling you to apply/save/make/do them, use action="none" and give your analysis only. Do NOT update_profile or feedback until he clearly says to apply it (e.g. "do it", "apply that", "go ahead", "save it"). resume_view is read-only and always allowed.
 - NEVER claim you updated, saved, changed, or adjusted his profile/settings/rubric unless action is update_profile or feedback. With action="none" you must not say you changed anything — only answer or give analysis.`;
@@ -490,53 +637,150 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const args = routed.args || {};
     let out = mdToHtml(routed.reply || "");
 
+    // ---- Indeed link → real fetch ----
+    // If he pasted an Indeed job link (not the full text) and wants a letter or
+    // a question answered, fetch the actual listing via Apify and use IT. This
+    // is the only path that opens a link. Heavy work runs AFTER an immediate ack
+    // via EdgeRuntime.waitUntil, so the webhook returns fast and Telegram never
+    // retries (which would double-process). Non-Indeed links (no jk) fall
+    // through to the per-branch "paste the text" guard below.
+    const indeedJk = pastedJob(text) ? null : extractJk(text);
+    if (indeedJk && (action === "cover_letter" || action === "lookup_job")) {
+      await reply(token, chatId, "🔎 Pulling that listing from Indeed…");
+      const bg = (async () => {
+        try {
+          const job = await fetchIndeedJob(indeedJk, cfg.apify_token);
+          if (!job) {
+            const m = "I couldn't pull that listing — it may be expired, or it's a board I can't open. Paste the full job text and I'll work from it.";
+            await reply(token, chatId, m);
+            await saveTurn(chatKey, "user", text);
+            await saveTurn(chatKey, "assistant", m);
+            return;
+          }
+          let bgOut: string;
+          if (action === "cover_letter") {
+            const jobBlock =
+              `JOB: ${job.job_title} at ${job.company}\n${job.location || ""}\n\nDESCRIPTION:\n${(job.description || "").slice(0, 6000)}`;
+            const letter = await genCoverLetter(
+              orKey, jobBlock, String(args.instruction || "standard"), text, history,
+            );
+            const age = agePosted(job.date_posted);
+            bgOut = `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}\n` +
+              (age ? `🗓 ${esc(age)}\n` : "") + `${esc(job.job_url_direct)}\n\n` + mdToHtml(letter);
+          } else {
+            const jobBlock =
+              `JOB: ${job.job_title} at ${job.company}\nLocation: ${job.location || "?"}\n\nDESCRIPTION:\n${(job.description || "").slice(0, 5000)}`;
+            const ans = await genLookupAnswer(orKey, jobBlock, String(args.question || text));
+            bgOut = `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}\n\n` + mdToHtml(ans);
+          }
+          // Stash the fetched job so a follow-up ("make it tighter") reuses it
+          // instead of falling into findJob and grabbing a random DB role.
+          await setActiveJob(chatKey, job, "indeed_fetch");
+          await reply(token, chatId, bgOut);
+          await saveTurn(chatKey, "user", text);
+          await saveTurn(chatKey, "assistant", bgOut);
+        } catch (e) {
+          console.error("indeed fetch bg error", e);
+          await reply(token, chatId, "⚠️ Hit a snag pulling that listing. Paste the job text and I'll do it.");
+        }
+      })();
+      // @ts-ignore — EdgeRuntime is provided by the Supabase edge runtime
+      EdgeRuntime.waitUntil(bg);
+      return new Response("ok");
+    }
+
     if (action === "lookup_job") {
       // Search ALL active jobs (not just the top matches) for a specific listing,
       // then answer his question grounded in it (or from general knowledge if missing).
       const pasted = pastedJob(text);
+      if (!pasted && hasJobUrl(text)) {
+        // A link to a job we can't open and no pasted text → never guess a DB row.
+        out = "I can't open links — I only know listings I've already scraped into your matches. Paste the full job text (copy the whole description) and I'll break it down.";
+        await reply(token, chatId, out);
+        await saveTurn(chatKey, "user", text);
+        await saveTurn(chatKey, "assistant", out);
+        return new Response("ok");
+      }
       const hint = String(args.job_hint || "").trim();
-      const job = pasted ? null : (hint ? await findJob(hint) : null);
+      const active = await getActiveJob(chatKey);
+      // Same sticky rule as letters: a follow-up ("is it remote?") stays on the
+      // active job; only switch when his own words name a different one.
+      let job: any = pasted ? null : active;
+      if (!pasted) {
+        if (hint && hintInText(text, hint)) job = (await findJob(hint)) || active;
+        else if (!active && hint) job = await findJob(hint);
+      }
       const question = String(args.question || text);
+      const legitLine = (j: any) =>
+        j && j.legitimacy_verdict && j.legitimacy_verdict !== "LEGIT"
+          ? `\nLEGITIMACY FLAG: ${j.legitimacy_verdict}${j.legitimacy_summary ? ` — ${j.legitimacy_summary}` : ""}. If asked anything about this employer, lead with this warning.`
+          : "";
       const jobBlock = pasted
         ? `JOB (pasted by Otis — answer about THIS listing, do not look one up):\n${pasted.slice(0, 5000)}`
         : job
-        ? `JOB: ${job.job_title} at ${job.company}\nLocation: ${job.location || "?"}\nScore: ${job.resume_score ?? "?"}/100\n\nDESCRIPTION:\n${(job.description || "").slice(0, 5000)}`
-        : `(No job matching "${hint}" was found in the scraped listings — it may have aged out or scored low. Answer from general knowledge and say it wasn't in his current listings.)`;
-      const ans = await callLLM(orKey, {
-        model: MODEL,
-        system: "You are Otis's job-scout assistant. Answer his question about the job/platform concisely in plain text + light Markdown (**bold**, - bullets). Otis works almost entirely through Claude Code (AI-assisted automation and dev) and cares whether a role lets him leverage it — call that out when relevant. Ground your answer in the job data if provided; otherwise use general knowledge.",
-        user: `${jobBlock}\n\nOtis asks: ${question}`,
-        maxTokens: 700,
-        source: "bot_lookup",
-      });
+        ? `JOB: ${job.job_title} at ${job.company}\nLocation: ${job.location || "?"}\nScore: ${job.resume_score ?? "?"}/100${legitLine(job)}\n\nDESCRIPTION:\n${(job.description || "").slice(0, 5000)}`
+        : hint
+        ? `(No job matching "${hint}" was found in the scraped listings — it may have aged out or scored low. Answer from general knowledge and say it wasn't in his current listings.)`
+        : `(No specific job in context. Answer from general knowledge.)`;
+      const ans = await genLookupAnswer(orKey, jobBlock, question);
+      const vBadge: Record<string, string> = {
+        AVOID: " · 🛑 AVOID", SUSPICIOUS: " · ⚠️ suspicious", CAUTION: " · ⚠️ caution",
+      };
       const head = job
         ? `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}` +
-          (job.resume_score != null ? ` · ${Math.round(job.resume_score / 10)}/10` : "") + "\n\n"
+          (job.resume_score != null ? ` · ${Math.round(job.resume_score / 10)}/10` : "") +
+          (vBadge[String(job.legitimacy_verdict || "").toUpperCase()] || "") + "\n\n"
         : "";
       out = head + mdToHtml(ans);
+      if (pasted) {
+        await setActiveJob(chatKey, {
+          job_title: "the pasted listing", company: "", location: "",
+          description: pasted, job_url_direct: "", date_posted: null,
+        }, "pasted");
+      } else if (job) {
+        await setActiveJob(chatKey, job, "lookup_job");
+      }
     } else if (action === "cover_letter") {
-      const [asset, resume] = await Promise.all([getAsset("cover_letter_system"), getResumeText()]);
       const pasted = pastedJob(text);
+      if (!pasted && hasJobUrl(text)) {
+        // A link to a job we can't open and no pasted text → never write a letter
+        // for a random DB row. Ask Otis to paste the listing first.
+        out = "I can't open job links yet — I only know listings I've already scraped. Paste the full job text (copy the whole description) and I'll write the letter.";
+        await reply(token, chatId, out);
+        await saveTurn(chatKey, "user", text);
+        await saveTurn(chatKey, "assistant", out);
+        return new Response("ok");
+      }
       const hint = String(args.job_hint || "").trim();
-      const job = pasted ? null : (hint ? await findJob(hint) : null);
+      const active = await getActiveJob(chatKey);
+      // STICKY job: default to the active job (the one we're working on). Only
+      // switch when his OWN words name a different job — a grounded hint — or
+      // when there's no active job yet. This stops the router from inventing a
+      // DB role on a revision and yanking the letter onto the wrong job.
+      let job: any = pasted ? null : active;
+      if (!pasted) {
+        if (hint && hintInText(text, hint)) job = (await findJob(hint)) || active;
+        else if (!active && hint) job = await findJob(hint);
+      }
       const jobBlock = pasted
         ? `JOB (pasted by Otis — write the letter for THIS listing, do not look one up):\n${pasted.slice(0, 6000)}`
         : job
         ? `JOB: ${job.job_title} at ${job.company}\n${job.location || ""}\n\nDESCRIPTION:\n${(job.description || "").slice(0, 6000)}`
         : "(Revise the cover letter already in this conversation — the job is in the history above.)";
       const instruction = String(args.instruction || "standard");
-      const letter = await callLLM(orKey, {
-        model: MODEL_LETTER,
-        system: `${asset}\n\n=== OTIS'S RESUME (for detail; do not contradict the facts above) ===\n${resume.slice(0, 3500)}`,
-        user: `${jobBlock}\n\nINSTRUCTION: ${instruction}\nUser's exact words: ${text}`,
-        history: history.slice(-6),
-        cacheSystem: true,
-        maxTokens: 900,
-        source: "bot_cover_letter",
-      });
+      const letter = await genCoverLetter(orKey, jobBlock, instruction, text, history);
       const age = job ? agePosted(job.date_posted) : null;
       out = (job ? `📄 <b>${esc(job.job_title)}</b> — ${esc(job.company)}\n` + (age ? `🗓 ${esc(age)}\n` : "") +
         (job.job_url_direct ? `${esc(job.job_url_direct)}\n` : "") + "\n" : "") + mdToHtml(letter);
+      // Remember what we worked on so the next revision reuses it (not findJob).
+      if (pasted) {
+        await setActiveJob(chatKey, {
+          job_title: "the pasted listing", company: "", location: "",
+          description: pasted, job_url_direct: "", date_posted: null,
+        }, "pasted");
+      } else if (job) {
+        await setActiveJob(chatKey, job, "cover_letter");
+      }
     } else if (action === "update_profile") {
       const field = String(args.field || "");
       const allowedFields = [

@@ -13,6 +13,7 @@ ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY")  # legacy, unused
 OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY")
 EMAILIT_API_KEY: str = os.environ.get("EMAILIT_API_KEY")
 APIFY_TOKEN: str = os.environ.get("APIFY_TOKEN")
+FIRECRAWL_API_KEY: str = os.environ.get("FIRECRAWL_API_KEY", "")  # Tier 2 reputation web search
 
 # Heartbeat monitor (dead-man's-switch). Optional — leave unset and the
 # pipeline simply skips the ping. Set it to a healthchecks.io ping URL to
@@ -78,6 +79,23 @@ APIFY_LOCAL_RADIUS = "50"  # miles — covers the Treasure Coast + north Palm Be
 SCORING_MODEL = "google/gemini-2.5-flash-lite"
 SCORING_THRESHOLD = 5  # minimum score to include in digest (out of 10)
 JOBS_TO_SCORE_PER_RUN = 150  # matches APIFY_MAX_ROWS_GLOBAL so a day clears same-run
+
+# =================================================================
+# 3b. LEGITIMACY / SCAM SCREEN
+# =================================================================
+# Two-tier "is this real?" gate that runs alongside fit scoring:
+#   Tier 1 (scam_check.py): free heuristic on every new job -> scam_risk_score.
+#   Tier 2 (reputation.py): Firecrawl web search + LLM verdict, cached per
+#   company, run ONLY on jobs that clear SCORING_THRESHOLD (the digest set), so
+#   the web spend stays tiny. An AVOID verdict demotes + warns; it never silently
+#   deletes a job (false-positive safety — Otis keeps the final call).
+SCREEN_ENABLED = True
+LEGITIMACY_MODEL = "google/gemini-2.5-flash"   # judges reputation snippets (cheap, capable)
+LEGITIMACY_SEARCH_LIMIT = 8                      # Firecrawl results per query
+LEGITIMACY_EXTRA_SEARCH = False                  # add a 2nd "official site/funding" query (more credits)
+LEGITIMACY_CACHE_DAYS = 45                       # re-check a company only after this many days
+LEGITIMACY_MAX_COMPANIES_PER_RUN = 25            # hard cap on Tier 2 checks per run (cost ceiling)
+SCAM_RISK_WARN_THRESHOLD = 35                    # heuristic score that surfaces a warning in the digest
 
 # =================================================================
 # 4. DELIVERY CONFIGURATION
