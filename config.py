@@ -56,14 +56,23 @@ COMPANY_BLOCKLIST = [
     "DataAnnotation",
 ]
 
-# Apify scraper settings (borderline/indeed-scraper)
-APIFY_ACTOR_ID = "borderline/indeed-scraper"
+# Apify scraper settings (memo23/apify-indeed-cheerio-ppr)
+# Swapped off borderline/indeed-scraper 06-30-2026: borderline ran $0.40-1.26/run
+# (~$26/mo, ate the whole Apify plan). memo23 is the "bypass 25-cap" Cheerio
+# scraper — cost is driven by maxJobs (it pages the full result set then trims to
+# maxJobs). Measured cost model: ~$0.0014 per job returned (e.g. maxJobs=80 ≈
+# $0.11/run ≈ $3.4/mo), which fits Apify's FREE tier ($5/mo credits). See
+# APIFY-COST-NOTES.md for the full measurement.
+APIFY_ACTOR_ID = "memo23/apify-indeed-cheerio-ppr"
 APIFY_COUNTRY = "us"
 APIFY_JOB_TYPES = ["fulltime", "contract", "parttime"]  # Indeed jt() filter values
 APIFY_FROM_DAYS = "1"  # last 24h. Precision queries catch a role the day it posts; widening this just adds cost. Breadth = alert-email ingestion.
 APIFY_SORT = "date"  # newest first
-APIFY_MAX_ROWS_PER_QUERY = 15  # per Indeed search URL — narrow queries rarely exceed this, so the cap doesn't bite
-APIFY_MAX_ROWS_GLOBAL = 150  # hard ceiling per run (cost cap)
+# maxJobs is the cost dial for memo23 — it caps the crawl, not just the output.
+# 80 keeps a daily run ~$3.4/mo (under the $5 free-tier credit) with margin. The
+# breadth layer is alert-email ingestion, so the scrape doesn't need to be deep.
+# Bump toward 120-150 only if daily new-job volume ever justifies the higher cost.
+APIFY_MAX_ROWS_GLOBAL = 80  # hard ceiling per run = memo23 maxJobs (cost cap)
 
 # Local search — on-site/hybrid jobs near home base. Each query runs twice:
 # once nationwide-remote, once location-bound to this area.

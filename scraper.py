@@ -1,11 +1,15 @@
 """
-Job scraper using Apify borderline/indeed-scraper actor.
+Job scraper using Apify memo23/apify-indeed-cheerio-ppr actor.
 
 Scrapes Indeed for both nationwide remote roles and on-site/hybrid roles near
 the agent's home base, across part-time, contract, and full-time job types.
 Replaces JobSpy (which got blocked from datacenter IPs).
 
-Single actor run per pipeline. All queries packed into urls[] input.
+Single actor run per pipeline. All queries packed into startUrls[] input.
+
+Actor swapped off borderline/indeed-scraper on 06-30-2026 (cost: borderline
+~$26/mo vs memo23 ~$3/mo on the free tier). memo23 returns a different output
+shape — _map_apify_item below translates it to our job schema.
 """
 
 import logging
@@ -41,59 +45,57 @@ def _make_dedup_key(title: str, company: str) -> str:
     return hashlib.md5(normalized.encode()).hexdigest()
 
 
-def _extract_level(attributes: list) -> str:
-    """Pull seniority level out of borderline's attributes array."""
-    if not attributes:
+def _extract_level(item: dict) -> str:
+    """
+    Best-effort seniority level from memo23 output. memo23 has no clean level
+    field (borderline had an attributes array), so we sniff the title + the
+    requirements/skills blob. Returns None when nothing matches — level is a
+    nice-to-have for scoring, not a hard requirement.
+    """
+    blob = " ".join(
+        str(item.get(k) or "")
+        for k in ("positionName", "normTitle", "requirements")
+    ).lower()
+    if not blob.strip():
         return None
-    level_map = {
-        "entry level": "entry",
-        "mid level": "mid",
-        "senior level": "senior",
-    }
-    for attr in attributes:
-        key = str(attr).strip().lower()
-        if key in level_map:
-            return level_map[key]
+    if "senior" in blob or "sr." in blob or "staff " in blob or "principal" in blob:
+        return "senior"
+    if "entry level" in blob or "entry-level" in blob or "junior" in blob or "jr." in blob:
+        return "entry"
+    if "mid level" in blob or "mid-level" in blob:
+        return "mid"
     return None
 
 
-def _format_location(loc: dict) -> str:
-    """Render raw location from borderline output (HQ city/state)."""
-    if not loc:
-        return None
-    return (
-        loc.get("formattedAddressShort")
-        or loc.get("fullAddress")
-        or loc.get("formattedAddressLong")
-    )
-
-
 def _map_apify_item(item: dict) -> dict:
-    """Translate borderline output → our job schema."""
-    job_key = item.get("jobKey")
-    title = item.get("title")
-    company = item.get("companyName")
-    description = item.get("descriptionText") or ""
+    """Translate memo23/apify-indeed-cheerio-ppr output → our job schema."""
+    job_key = item.get("jobId")
+    title = item.get("positionName")
+    company = item.get("company")
+    description = item.get("jobDescription") or ""
 
     if not title or not job_key:
         return None
 
     job_id = str(job_key)
 
-    job_type_arr = item.get("jobType") or []
-    job_type = job_type_arr[0].lower() if job_type_arr else None
+    # memo23 jobType is a comma-joined string e.g. "Full-time, Contract".
+    # Normalize the first type to borderline's style: "full-time" -> "fulltime".
+    raw_type = item.get("jobType") or ""
+    first_type = raw_type.split(",")[0].strip().lower() if raw_type else ""
+    job_type = first_type.replace("-", "").replace(" ", "") or None
 
-    is_remote = bool(item.get("isRemote"))
-    location_str = _format_location(item.get("location") or {})
+    remote_val = item.get("remote")
+    is_remote = bool(remote_val) if remote_val is not None else False
+    location_str = item.get("location") or item.get("fullAddress")
 
-    salary = item.get("salary") or {}
-    salary_min = salary.get("min") or salary.get("salaryMin")
-    salary_max = salary.get("max") or salary.get("salaryMax")
-    salary_interval = salary.get("unit") or salary.get("salaryType")
-    salary_currency = salary.get("currency") or salary.get("salaryCurrency")
+    salary_min = item.get("salaryMin")
+    salary_max = item.get("salaryMax")
+    salary_interval = (item.get("salaryType") or "").lower() or None
+    salary_currency = item.get("currency")
 
-    level = _extract_level(item.get("attributes") or [])
-    job_url = item.get("jobUrl")
+    level = _extract_level(item)
+    job_url = item.get("jobUrl") or item.get("url")
     date_posted = item.get("datePublished")
 
     return {
@@ -147,7 +149,7 @@ def scrape_all_queries() -> list:
     global LAST_SCRAPE_ERROR
     LAST_SCRAPE_ERROR = None
 
-    logging.info("--- Starting Job Scraping (Apify borderline, single run) ---")
+    logging.info("--- Starting Job Scraping (Apify memo23, single run) ---")
 
     existing_ids, existing_company_title_pairs = supabase_utils.get_existing_jobs_from_supabase()
     logging.info(f"Found {len(existing_ids)} existing jobs in database")
@@ -161,13 +163,19 @@ def scrape_all_queries() -> list:
         f"({len(remote_urls)} remote + {len(local_urls)} local near {config.APIFY_LOCAL_LOCATION})"
     )
 
+    # memo23 schema: startUrls is an array of {url} objects. maxJobs caps the
+    # crawl (the cost dial). expandToCities=False stops it fanning a country/region
+    # URL into per-city crawls (our URLs are already scoped). flattenOutput gives
+    # us a flat dict per job (the shape _map_apify_item expects). RESIDENTIAL proxy
+    # is what gets past Indeed's bot wall.
     run_input = {
-        "urls": urls,
-        "country": config.APIFY_COUNTRY,
-        "maxRowsPerUrl": config.APIFY_MAX_ROWS_PER_QUERY,
-        "maxRows": config.APIFY_MAX_ROWS_GLOBAL,
-        "enableUniqueJobs": True,
-        "includeSimilarJobs": False,
+        "startUrls": [{"url": u} for u in urls],
+        "maxJobs": config.APIFY_MAX_ROWS_GLOBAL,
+        "expandToCities": False,
+        "flattenOutput": True,
+        "includeCompanyDetails": False,
+        "strictMatch": False,
+        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
     }
 
     raw_items = []
