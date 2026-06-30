@@ -46,12 +46,16 @@ RESIDENTIAL proxy):
 | maxJobs | jobs returned | run cost | ≈ /mo (daily) |
 |---|---|---|---|
 | 150 | 150 | $0.1945 | ~$5.8 (over free tier) |
+| 80 | ~100 (soft cap, 18 URLs) | ~$0.14 | ~$4.2 (thin margin) |
 | 30 | 30 | $0.0445 | ~$1.3 |
-| **80 (chosen)** | 80 | **~$0.11** | **~$3.4 (fits free tier)** |
+| **60 (chosen)** | ~75 | **~$0.10** | **~$3.1 (free tier, good margin)** |
 
 Model: **~$0.0014 per job returned.** `maxJobs` caps the crawl (the cost), not
-just the output — confirmed by the 150-vs-30 runs above. `config.py`
-`APIFY_MAX_ROWS_GLOBAL` = memo23 `maxJobs`, set to **80**.
+just the output — confirmed by the 150-vs-30 runs. **Caveat:** with many
+`startUrls` it's a SOFT cap — a live 18-URL CI run at maxJobs=80 returned ~100
+raw items (it finishes each URL's current page batch, ~+25% overshoot). So size
+maxJobs ~20% under the item count you actually want. `config.py`
+`APIFY_MAX_ROWS_GLOBAL` = memo23 `maxJobs`, set to **60** (≈75 actual items).
 
 **Data-quality: VERIFIED equivalent.** Every field we save (positionName→title,
 company, jobDescription→description, jobId→job_id, location, salaryMin/Max,

@@ -69,10 +69,13 @@ APIFY_JOB_TYPES = ["fulltime", "contract", "parttime"]  # Indeed jt() filter val
 APIFY_FROM_DAYS = "1"  # last 24h. Precision queries catch a role the day it posts; widening this just adds cost. Breadth = alert-email ingestion.
 APIFY_SORT = "date"  # newest first
 # maxJobs is the cost dial for memo23 — it caps the crawl, not just the output.
-# 80 keeps a daily run ~$3.4/mo (under the $5 free-tier credit) with margin. The
-# breadth layer is alert-email ingestion, so the scrape doesn't need to be deep.
-# Bump toward 120-150 only if daily new-job volume ever justifies the higher cost.
-APIFY_MAX_ROWS_GLOBAL = 80  # hard ceiling per run = memo23 maxJobs (cost cap)
+# NOTE: it's a SOFT cap with many startUrls — a live 18-URL CI run at maxJobs=80
+# returned ~100 raw items (it finishes each URL's current page batch, ~+25%). So
+# real cost ≈ (actual items) × ~$0.0014. 60 → ~75 actual → ~$0.10/run → ~$3.1/mo,
+# which keeps comfortable margin under the $5 free-tier credit even with a few
+# manual runs. The breadth layer is alert-email ingestion, so the scrape doesn't
+# need to be deep. Bump toward 120-150 only if daily volume ever justifies it.
+APIFY_MAX_ROWS_GLOBAL = 60  # soft ceiling per run = memo23 maxJobs (cost dial)
 
 # Local search — on-site/hybrid jobs near home base. Each query runs twice:
 # once nationwide-remote, once location-bound to this area.
