@@ -30,18 +30,23 @@ from telegram_notify import send_telegram_nudge, send_telegram_alert
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def ping_heartbeat():
+def ping_heartbeat(success: bool = True):
     """
     Ping the external heartbeat monitor so it knows the pipeline ran.
+    success=False hits the /fail endpoint so the monitor alerts right away
+    instead of showing green for a run that exits non-zero. The rule:
+    heartbeat success if and only if the process exits 0.
     Dormant until HEALTHCHECK_URL is set — a no-op otherwise, so this is
     safe to ship before the monitor account exists.
     """
     url = config.HEALTHCHECK_URL
     if not url:
         return
+    if not success:
+        url = url.rstrip("/") + "/fail"
     try:
         httpx.get(url, timeout=10)
-        logging.info("Heartbeat ping sent.")
+        logging.info("Heartbeat ping sent." if success else "Heartbeat FAIL ping sent.")
     except Exception as e:
         logging.warning(f"Heartbeat ping failed: {e}")
 
@@ -139,8 +144,10 @@ def run_pipeline():
     logging.info(f"\n{cost_tracker.tracker.summary()}")
     logging.info("=" * 60)
 
-    # Tell the heartbeat monitor this run happened.
-    ping_heartbeat()
+    # Tell the heartbeat monitor how this run went. A scraper hard-failure
+    # exits non-zero below, so it must ping /fail here — a plain success ping
+    # would leave the monitor green while the Actions run shows red.
+    ping_heartbeat(success=not scraper.LAST_SCRAPE_ERROR)
 
 
 if __name__ == "__main__":
@@ -166,6 +173,7 @@ if __name__ == "__main__":
                 "Job Scout: pipeline crashed",
                 f"The pipeline crashed with an uncaught error:\n\n{e}",
             )
+            ping_heartbeat(success=False)  # alert the monitor now, not after the grace window
             raise  # surface as a failed GitHub Actions run, no more fake green
 
         # Scrape failed but the pipeline still finished its other steps and
