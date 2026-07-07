@@ -1,9 +1,13 @@
 # Pinned 05-21-2026. Unpinned deps let apify-client float to 3.0.0, which
 # broke scraper.py (Run object replaced the old dict). Pin everything so a
 # third-party release can never silently break the pipeline again.
+# 07-06-2026: apify-client 3.0.0 -> 3.0.4. Apify added tiered per-event
+# pricing to actor metadata; 3.0.0's strict ActorResponse model rejected it
+# (eventPriceUsd "field required") and hard-failed the scraper. 3.0.1+ knows
+# the new schema.
 python-dotenv==1.2.2
 supabase==2.30.0
 httpx==0.28.1
 pydantic==2.13.4
-apify-client==3.0.0
+apify-client==3.0.4
 anthropic==0.103.1
