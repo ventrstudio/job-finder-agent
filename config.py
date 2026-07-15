@@ -82,6 +82,19 @@ APIFY_MAX_ROWS_GLOBAL = 60  # soft ceiling per run = memo23 maxJobs (cost dial)
 APIFY_LOCAL_LOCATION = "Port St. Lucie, FL"
 APIFY_LOCAL_RADIUS = "50"  # miles — covers the Treasure Coast + north Palm Beach County
 
+# LinkedIn jobs source (added 07-14-2026). curious_coder/linkedin-jobs-scraper
+# scrapes LinkedIn's PUBLIC guest jobs search — no cookie, no LinkedIn account
+# touched. Pay-per-result $0.001/job; `count` is a HARD cap on dataset items
+# (verified live 07-14: count=10 returned exactly 10), so cost = count × $0.001
+# per run. count=40 daily ≈ $1.2/mo. Total Apify (Indeed ~$3.1 + LinkedIn ~$1.2)
+# ≈ $4.3/mo — still under the $5 free-tier credit, but the margin is thin: if
+# either dial goes up, something else must come down.
+LINKEDIN_ENABLED = True
+LINKEDIN_ACTOR_ID = "curious_coder/linkedin-jobs-scraper"
+LINKEDIN_MAX_ROWS = 40  # actor `count` (min 10) — the LinkedIn cost dial
+LINKEDIN_JOB_TYPES = ["F", "C", "P"]  # LinkedIn f_JT values: Full-time, Contract, Part-time
+LINKEDIN_LOCAL_LOCATION = "Port St. Lucie, Florida, United States"
+
 # =================================================================
 # 3. SCORING CONFIGURATION
 # =================================================================

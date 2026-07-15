@@ -1,15 +1,17 @@
 """
-Job scraper using Apify memo23/apify-indeed-cheerio-ppr actor.
+Job scraper using Apify actors: Indeed (memo23/apify-indeed-cheerio-ppr) +
+LinkedIn (curious_coder/linkedin-jobs-scraper, added 07-14-2026).
 
-Scrapes Indeed for both nationwide remote roles and on-site/hybrid roles near
-the agent's home base, across part-time, contract, and full-time job types.
+Both sources scrape nationwide remote roles and on-site/hybrid roles near the
+agent's home base, across part-time, contract, and full-time job types.
 Replaces JobSpy (which got blocked from datacenter IPs).
 
-Single actor run per pipeline. All queries packed into startUrls[] input.
+One actor run per source per pipeline; all queries packed into each run's
+urls input. Per-source mappers translate output shapes to our job schema.
 
 Actor swapped off borderline/indeed-scraper on 06-30-2026 (cost: borderline
-~$26/mo vs memo23 ~$3/mo on the free tier). memo23 returns a different output
-shape — _map_apify_item below translates it to our job schema.
+~$26/mo vs memo23 ~$3/mo on the free tier). LinkedIn actor is pay-per-result
+($0.001/job, no cookie — never touches a real LinkedIn account).
 """
 
 import logging
@@ -117,6 +119,65 @@ def _map_apify_item(item: dict) -> dict:
     }
 
 
+def _map_linkedin_item(item: dict) -> dict:
+    """
+    Translate curious_coder/linkedin-jobs-scraper output → our job schema.
+    Shape verified on a live run 07-14-2026: id, link, title, companyName,
+    location, postedAt (YYYY-MM-DD), descriptionText, seniorityLevel,
+    employmentType, salary (display string, usually empty), inputUrl.
+    """
+    job_key = item.get("id")
+    title = item.get("title")
+    company = item.get("companyName")
+    description = item.get("descriptionText") or ""
+
+    if not title or not job_key:
+        return None
+
+    raw_type = item.get("employmentType") or ""
+    job_type = raw_type.strip().lower().replace("-", "").replace(" ", "") or None
+
+    # Guest search results carry no remote flag. The remote-scoped search URLs
+    # embed f_WT=2, and inputUrl tells us which search produced the item.
+    input_url = item.get("inputUrl") or ""
+    blob = f"{title} {item.get('location') or ''}".lower()
+    is_remote = "f_WT=2" in input_url or "remote" in blob
+
+    seniority = (item.get("seniorityLevel") or "").lower()
+    if any(s in seniority for s in ("senior", "director", "executive")):
+        level = "senior"
+    elif any(s in seniority for s in ("entry", "internship")):
+        level = "entry"
+    elif any(s in seniority for s in ("mid", "associate")):
+        level = "mid"
+    else:
+        level = None
+
+    # link carries refId/trackingId params — strip them so the URL is stable.
+    job_url = (item.get("link") or "").split("?")[0] or None
+
+    return {
+        # Prefix guards against ID collision with Indeed's job key space.
+        "job_id": f"li-{job_key}",
+        "company": company,
+        "job_title": title,
+        "location": item.get("location"),
+        "description": description,
+        "provider": "linkedin",
+        "level": level,
+        "job_type": job_type,
+        # salary is a display string ("$100,000.00/yr - ...") too inconsistent
+        # to parse reliably; scoring reads the description text anyway.
+        "salary_min": None,
+        "salary_max": None,
+        "salary_interval": None,
+        "salary_currency": None,
+        "is_remote": is_remote,
+        "job_url_direct": job_url,
+        "date_posted": item.get("postedAt"),
+    }
+
+
 def _build_indeed_url(query: str, *, remote: bool) -> str:
     """
     Build an Indeed search URL with multi-jobType filter and a 24hr filter.
@@ -141,20 +202,72 @@ def _build_indeed_url(query: str, *, remote: bool) -> str:
     return base + f"&l={loc}&radius={config.APIFY_LOCAL_RADIUS}"
 
 
+def _build_linkedin_url(query: str, *, remote: bool) -> str:
+    """
+    Build a LinkedIn public (guest) jobs search URL. Mirrors the Indeed scope
+    split: remote=True -> nationwide remote-only (f_WT=2), remote=False ->
+    location-bound near home base. f_TPR=r86400 = last 24h (same window as
+    APIFY_FROM_DAYS=1), sortBy=DD = newest first.
+    """
+    q = quote_plus(query)
+    jt = quote_plus(",".join(config.LINKEDIN_JOB_TYPES))
+    base = (
+        f"https://www.linkedin.com/jobs/search/?keywords={q}"
+        f"&f_TPR=r86400"
+        f"&f_JT={jt}"
+        f"&sortBy=DD"
+    )
+    if remote:
+        return base + "&f_WT=2&location=" + quote_plus("United States")
+    return (
+        base
+        + "&location=" + quote_plus(config.LINKEDIN_LOCAL_LOCATION)
+        + f"&distance={config.APIFY_LOCAL_RADIUS}"
+    )
+
+
+def _run_actor(actor_id: str, run_input: dict, source_name: str) -> list:
+    """
+    Call one Apify actor and drain its default dataset. Returns raw items;
+    on failure logs, appends to LAST_SCRAPE_ERROR, and returns [] so the
+    other source's results still flow.
+    """
+    global LAST_SCRAPE_ERROR
+    client = _get_client()
+    raw_items = []
+    try:
+        run = client.actor(actor_id).call(run_input=run_input)
+        # apify-client 3.x returns a Run model object; 2.x returns a dict.
+        dataset_id = getattr(run, "default_dataset_id", None) or (
+            run.get("defaultDatasetId") if isinstance(run, dict) else None
+        )
+        if dataset_id:
+            for item in client.dataset(dataset_id).iterate_items():
+                raw_items.append(item)
+        logging.info(f"[{source_name}] actor returned {len(raw_items)} raw items")
+    except Exception as e:
+        err = f"[{source_name}] {e}"
+        LAST_SCRAPE_ERROR = f"{LAST_SCRAPE_ERROR}; {err}" if LAST_SCRAPE_ERROR else err
+        logging.error(f"Apify scrape failed: {err}")
+    return raw_items
+
+
 def scrape_all_queries() -> list:
     """
-    Single Apify run, all queries packed as urls[]. Dedupe against DB + within run.
-    Hard cap via APIFY_MAX_ROWS_GLOBAL.
+    One Apify run per source (Indeed memo23 + LinkedIn guest search), all
+    queries packed as urls[]. Dedupe against DB + within run (cross-source:
+    the company|title key catches the same role posted on both boards).
+    A single source failing alerts (LAST_SCRAPE_ERROR) but does not drop the
+    other source's results.
     """
     global LAST_SCRAPE_ERROR
     LAST_SCRAPE_ERROR = None
 
-    logging.info("--- Starting Job Scraping (Apify memo23, single run) ---")
+    logging.info("--- Starting Job Scraping (Apify: Indeed + LinkedIn) ---")
 
     existing_ids, existing_company_title_pairs = supabase_utils.get_existing_jobs_from_supabase()
     logging.info(f"Found {len(existing_ids)} existing jobs in database")
 
-    client = _get_client()
     remote_urls = [_build_indeed_url(q, remote=True) for q in config.SEARCH_QUERIES]
     local_urls = [_build_indeed_url(q, remote=False) for q in config.SEARCH_QUERIES]
     urls = remote_urls + local_urls
@@ -168,7 +281,7 @@ def scrape_all_queries() -> list:
     # URL into per-city crawls (our URLs are already scoped). flattenOutput gives
     # us a flat dict per job (the shape _map_apify_item expects). RESIDENTIAL proxy
     # is what gets past Indeed's bot wall.
-    run_input = {
+    indeed_input = {
         "startUrls": [{"url": u} for u in urls],
         "maxJobs": config.APIFY_MAX_ROWS_GLOBAL,
         "expandToCities": False,
@@ -177,21 +290,26 @@ def scrape_all_queries() -> list:
         "strictMatch": False,
         "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
     }
+    # (source_name, mapper, raw_items) per source. Indeed first — it's the
+    # richer source (salary fields), so on a cross-source duplicate the Indeed
+    # record wins the dedup race.
+    sources = [
+        ("indeed", _map_apify_item, _run_actor(config.APIFY_ACTOR_ID, indeed_input, "indeed")),
+    ]
 
-    raw_items = []
-    try:
-        run = client.actor(config.APIFY_ACTOR_ID).call(run_input=run_input)
-        # apify-client 3.x returns a Run model object, not a dict.
-        # The dataset id is the `default_dataset_id` attribute.
-        dataset_id = run.default_dataset_id if run else None
-        if dataset_id:
-            for item in client.dataset(dataset_id).iterate_items():
-                raw_items.append(item)
-        logging.info(f"Actor returned {len(raw_items)} raw items")
-    except Exception as e:
-        LAST_SCRAPE_ERROR = str(e)
-        logging.error(f"Apify scrape failed: {e}")
-        return []
+    if config.LINKEDIN_ENABLED:
+        li_urls = [_build_linkedin_url(q, remote=True) for q in config.SEARCH_QUERIES] + [
+            _build_linkedin_url(q, remote=False) for q in config.SEARCH_QUERIES
+        ]
+        logging.info(f"Built {len(li_urls)} LinkedIn URLs for one actor run")
+        linkedin_input = {
+            "urls": li_urls,
+            "count": config.LINKEDIN_MAX_ROWS,
+            "scrapeCompany": False,
+        }
+        sources.append(
+            ("linkedin", _map_linkedin_item, _run_actor(config.LINKEDIN_ACTOR_ID, linkedin_input, "linkedin"))
+        )
 
     all_new_jobs = []
     seen_ids = set()
@@ -199,8 +317,10 @@ def scrape_all_queries() -> list:
 
     blocklist = [b.lower() for b in config.COMPANY_BLOCKLIST]
 
-    for item in raw_items:
-        job = _map_apify_item(item)
+    raw_items = [(mapper, item) for _, mapper, items in sources for item in items]
+
+    for mapper, item in raw_items:
+        job = mapper(item)
         if not job:
             continue
 

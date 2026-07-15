@@ -105,6 +105,33 @@ _VERDICT_STYLE = {
     "UNKNOWN":    ("#374151", "#f3f4f6", "❔ Unverified"),
 }
 
+# Source pill: the real brand favicon + a text label so the board is obvious
+# at a glance. Icon is pulled from Google's favicon service (returns a PNG,
+# renders reliably in Gmail — unlike inline SVG, which Gmail strips). The text
+# label is the fallback if a client blocks remote images.
+_SOURCE_STYLE = {
+    "linkedin": ("linkedin.com", "LinkedIn", "#0a66c2"),
+    "indeed":   ("indeed.com", "Indeed", "#2557a7"),
+}
+
+
+def _source_badge(job: dict) -> str:
+    provider = (job.get("provider") or "").lower()
+    style = _SOURCE_STYLE.get(provider)
+    if not style:
+        return ""
+    domain, label, color = style
+    icon = (
+        f'<img src="https://www.google.com/s2/favicons?domain={domain}&sz=64" '
+        f'width="14" height="14" alt="{label}" '
+        f'style="vertical-align:-2px;border:0;border-radius:3px;margin-right:5px;">'
+    )
+    return (
+        f'<span style="display:inline-block;background:#f3f4f6;color:{color};'
+        f'padding:2px 9px;border-radius:4px;font-weight:600;font-size:12px;'
+        f'margin-left:8px;">{icon}{label}</span>'
+    )
+
 
 def _render_legitimacy(job: dict) -> str:
     """Legitimacy verdict banner for the email row (Tier 2)."""
@@ -222,6 +249,7 @@ def build_email_html(scored_jobs: list) -> str:
                             <div style="font-size:14px;color:#6b7280;margin-top:2px;">{company}{(' &middot; ' + posted) if posted else ''}</div>
                         </td>
                         <td style="text-align:right;vertical-align:top;white-space:nowrap;">
+                            {_source_badge(job)}
                             <span style="display:inline-block;background:{score_bg};color:white;padding:4px 12px;border-radius:20px;font-weight:700;font-size:15px;">{score}/10</span>
                         </td>
                     </tr>

@@ -72,9 +72,10 @@ def run_pipeline():
             logging.error(f"Scraper hit a hard failure: {scraper.LAST_SCRAPE_ERROR}")
             send_telegram_alert(
                 "Job Scout: scraper failed",
-                "The scraper hit an error and pulled 0 new jobs:\n\n"
+                "A scrape source hit an error:\n\n"
                 f"{scraper.LAST_SCRAPE_ERROR}\n\n"
-                "Nothing new entered the pipeline today. A fix is needed.",
+                f"{len(new_jobs)} new jobs still came through from the surviving "
+                "source(s). If this repeats, a fix is needed.",
             )
 
         # Step 1b: ingest Indeed job-alert emails (the cheap "breadth" layer —
