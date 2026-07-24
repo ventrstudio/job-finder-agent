@@ -25,7 +25,6 @@ import alert_ingest
 import screen
 from score_jobs import score_unscored_jobs
 from send_digest import send_digest, send_alert
-from telegram_notify import send_telegram_nudge, send_telegram_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -70,7 +69,7 @@ def run_pipeline():
         new_jobs = scraper.scrape_all_queries()
         if scraper.LAST_SCRAPE_ERROR:
             logging.error(f"Scraper hit a hard failure: {scraper.LAST_SCRAPE_ERROR}")
-            send_telegram_alert(
+            send_alert(
                 "Job Scout: scraper failed",
                 "A scrape source hit an error:\n\n"
                 f"{scraper.LAST_SCRAPE_ERROR}\n\n"
@@ -91,7 +90,7 @@ def run_pipeline():
                 logging.info(f"Alert ingestion added {len(added)} new jobs "
                              f"(deduped {len(alert_jobs) - len(added)} already in this run)")
             if alert_ingest.LAST_INGEST_ERROR:
-                send_telegram_alert(
+                send_alert(
                     "Job Scout: alert ingest failed",
                     f"Indeed alert-email ingestion hit an error:\n\n{alert_ingest.LAST_INGEST_ERROR}",
                 )
@@ -128,10 +127,9 @@ def run_pipeline():
             logging.error(f"Tier 2 reputation check crashed (non-fatal): {e}", exc_info=True)
 
     # Step 4: Email digest (full batch) + one-line Telegram nudge
-    logging.info("\n--- STEP 4: Sending email digest + Telegram nudge ---")
+    logging.info("\n--- STEP 4: Sending email digest ---")
     if scored_jobs:
         send_digest(scored_jobs)
-        send_telegram_nudge(scored_jobs)
     else:
         logging.info("No scored jobs to send in digest.")
 

@@ -9,3 +9,5 @@ Daily Logs/
 *.jpg
 *.jpeg
 *.png
+.env.bak*
+supabase/.temp/
