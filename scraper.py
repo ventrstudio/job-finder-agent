@@ -16,6 +16,7 @@ Actor swapped off borderline/indeed-scraper on 06-30-2026 (cost: borderline
 
 import logging
 import hashlib
+from decimal import Decimal
 from urllib.parse import quote_plus
 
 from apify_client import ApifyClient
@@ -236,7 +237,11 @@ def _run_actor(actor_id: str, run_input: dict, source_name: str) -> list:
     client = _get_client()
     raw_items = []
     try:
-        run = client.actor(actor_id).call(run_input=run_input)
+        # HARD per-run charge cap — actor auto-aborts if a run exceeds it (see config).
+        run = client.actor(actor_id).call(
+            run_input=run_input,
+            max_total_charge_usd=Decimal(str(config.APIFY_MAX_RUN_USD)),
+        )
         # apify-client 3.x returns a Run model object; 2.x returns a dict.
         dataset_id = getattr(run, "default_dataset_id", None) or (
             run.get("defaultDatasetId") if isinstance(run, dict) else None

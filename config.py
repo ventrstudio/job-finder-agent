@@ -76,6 +76,11 @@ APIFY_SORT = "date"  # newest first
 # manual runs. The breadth layer is alert-email ingestion, so the scrape doesn't
 # need to be deep. Bump toward 120-150 only if daily volume ever justifies it.
 APIFY_MAX_ROWS_GLOBAL = 60  # soft ceiling per run = memo23 maxJobs (cost dial)
+# HARD per-run charge cap. memo23 is pay-per-event, so the actor AUTO-ABORTS the run
+# the instant its charges cross this line — a deterministic backstop UNDER the soft
+# maxJobs cap (which overshoots ~25% with many startUrls). The 07-25 runaway was $24.81;
+# with this, any run dies at $1.00 no matter what the input says. Normal run ~$0.10.
+APIFY_MAX_RUN_USD = 1.00
 
 # Local search — on-site/hybrid jobs near home base. Each query runs twice:
 # once nationwide-remote, once location-bound to this area.

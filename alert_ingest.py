@@ -32,6 +32,7 @@ import imaplib
 import logging
 import os
 import re
+from decimal import Decimal
 from email.message import Message
 from urllib.parse import quote_plus
 
@@ -204,7 +205,7 @@ def _fetch_full_jobs(targets: dict) -> list:
                 "enableUniqueJobs": True,
                 "includeSimilarJobs": False,
                 "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
-            })
+            }, max_total_charge_usd=Decimal(str(config.APIFY_MAX_RUN_USD)))
             for item in client.dataset(run.default_dataset_id).iterate_items():
                 jk = str(item.get("jobKey") or "").lower()
                 if jk in targets:
