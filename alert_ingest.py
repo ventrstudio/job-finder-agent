@@ -52,6 +52,13 @@ ALL_MAIL = '"[Gmail]/All Mail"'
 LOOKBACK_DAYS = 3             # how far back to scan for unprocessed alerts (daily run)
 MAX_EMAILS_PER_RUN = 8        # cap emails processed per run so a backlog can't blow up Apify cost
 APIFY_FETCH_ROWS_PER_QUERY = 20  # results per company search when fetching full JDs
+# HARD crawl ceiling for this path. memo23's REAL cost dial is maxJobs (it pages the
+# full result set then trims to maxRows) — leaving it at the actor default (20000) +
+# expandToCities default (true) is what let a 14-company run crawl 17,847 jobs = $24.81
+# on 07-25-2026 (85% of the monthly Apify plan in one run). maxRows only trims OUTPUT,
+# not the billed crawl. Always cap maxJobs + set expandToCities=False here (mirrors
+# scraper.py). 200 × ~$0.0014/job ≈ $0.28 worst case even on a big alert day.
+APIFY_ALERT_MAX_JOBS_CEILING = 200
 
 # Set when the last ingest hit a hard failure (vs a clean "no new jobs" run);
 # main.py can read this to alert, mirroring scraper.LAST_SCRAPE_ERROR.
@@ -172,12 +179,31 @@ def _fetch_full_jobs(targets: dict) -> list:
         ]
         try:
             client = _get_client()
+            # COST FIX 07-25-2026: use scraper.py's PROVEN startUrls schema + maxJobs cap
+            # + expandToCities=False. The old input used `urls` and left maxJobs/expandToCities
+            # at the actor DEFAULTS (20000 / true) — maxJobs is memo23's real cost dial (it
+            # caps the CRAWL; maxRows only trims OUTPUT), so a 14-company run crawled 17,847
+            # jobs = $24.81, 85% of the monthly plan in ONE run. Verified: `urls` schema
+            # returns 0 items even when it "works"; startUrls+maxJobs=20 returns items at
+            # $0.007. Also verified the `urls` schema returned 0 mappable rows, so this path
+            # already falls back to alert-email stubs — see KNOWN BUG note below.
+            #
+            # KNOWN BUG (not fixed here — filed separately): the match on line
+            # `item.get("jobKey")` never hits — memo23 items carry NO `jobKey` field (the
+            # Indeed jk lives inside `url` as ?jk=...; the mapper keys on `jobId`). So every
+            # target falls to the stub regardless. This fix makes the (currently useless)
+            # crawl cheap + non-catastrophic; making enrichment actually work is a follow-up.
+            max_jobs = min(APIFY_FETCH_ROWS_PER_QUERY * max(1, len(urls)), APIFY_ALERT_MAX_JOBS_CEILING)
             run = client.actor(config.APIFY_ACTOR_ID).call(run_input={
-                "urls": urls,
-                "maxRowsPerUrl": APIFY_FETCH_ROWS_PER_QUERY,
-                "maxRows": APIFY_FETCH_ROWS_PER_QUERY * max(1, len(urls)),
+                "startUrls": [{"url": u} for u in urls],
+                "maxJobs": max_jobs,               # HARD crawl cap (cost dial) — never omit
+                "expandToCities": False,           # never fan a search into per-city crawls
+                "flattenOutput": True,
+                "includeCompanyDetails": False,
+                "strictMatch": False,
                 "enableUniqueJobs": True,
                 "includeSimilarJobs": False,
+                "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
             })
             for item in client.dataset(run.default_dataset_id).iterate_items():
                 jk = str(item.get("jobKey") or "").lower()
