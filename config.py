@@ -100,6 +100,58 @@ LINKEDIN_MAX_ROWS = 40  # actor `count` (min 10) — the LinkedIn cost dial
 LINKEDIN_JOB_TYPES = ["F", "C", "P"]  # LinkedIn f_JT values: Full-time, Contract, Part-time
 LINKEDIN_LOCAL_LOCATION = "Port St. Lucie, Florida, United States"
 
+# -----------------------------------------------------------------
+# 2b. DEDICATED LOCAL SEARCH BUDGET + COMMUTE GRADING (07-26-2026)
+# -----------------------------------------------------------------
+# Why this exists: local jobs were getting starved. Remote + local Indeed URLs
+# shared ONE memo23 run at maxJobs=60, and the nationwide-remote pass (crawled
+# first) ate the whole budget, so the local URLs returned ~0. The fix is a
+# DEDICATED local run with its own budget + broader local queries. The narrow
+# remote terms ("Claude Code") barely exist in the Treasure Coast market, so
+# local uses generic, high-recall titles. Indeed q= is full-text (it matches the
+# title AND the description) and the scorer reads the full description anyway, so
+# generic titles are fine — the description text is what actually gets judged.
+LOCAL_SEARCH_QUERIES = [
+    "web developer",
+    "software developer",
+    "developer",
+    "IT",
+    "technology",
+    "automation",
+    "AI",
+    "API integration",
+    "React",
+    "Supabase",
+    "no-code",
+]
+
+# Dedicated maxJobs for the LOCAL memo23 run — a separate cost dial from the
+# remote run's APIFY_MAX_ROWS_GLOBAL. Kept modest; the local market is small.
+APIFY_LOCAL_MAX_ROWS = 40
+
+# Dedicated LinkedIn `count` for the LOCAL guest-search run (only used when
+# LINKEDIN_ENABLED). Smaller than the remote count — local supply is thin.
+LINKEDIN_LOCAL_MAX_ROWS = 20
+
+# --- Commute grading (home base -> job coordinates) ---
+# Home base for the commute estimate: zip 34952 (SE Port St. Lucie, FL).
+HOME_LAT = 27.2769
+HOME_LNG = -80.3006
+# Haversine fallback tuning (used only when OSRM routing is unreachable):
+# straight-line miles * ROAD_FACTOR / AVG_MPH * 60 = estimated drive minutes.
+COMMUTE_ROAD_FACTOR = 1.3   # roads aren't straight lines — pad the crow-flight distance
+COMMUTE_AVG_MPH = 42        # blended surface-street + highway average for the area
+
+# --- Location-tier ranking bonus ---
+# Added to resume_score (which is score*10) so preferred locations rank higher in
+# the digest. Tier order (best -> worst):
+#   1 = local + remote     (near home AND remote — ideal)
+#   2 = local hybrid       (near home, some in-office)
+#   3 = non-local remote   (remote but not tied to the local market)
+#   4 = local in-person    (near home, fully on-site)
+# The bumped resume_score is capped at 100 downstream so it still fits the column.
+LOCATION_TIER_BONUS = {1: 10, 2: 6, 3: 2, 4: 0}
+
 # =================================================================
 # 3. SCORING CONFIGURATION
 # =================================================================

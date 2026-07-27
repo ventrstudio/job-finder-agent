@@ -97,6 +97,62 @@ def _score_color(score: int) -> str:
     return "#6b7280"
 
 
+def _location_tag(job: dict) -> str:
+    """
+    Small label for the job's location fit, from search_scope + location_tier.
+    Tiers: 1 local+remote, 2 local hybrid, 3 non-local remote, 4 local on-site.
+    Returns "" when neither is set (e.g. alert-ingested jobs).
+    """
+    scope = (job.get("search_scope") or "").lower()
+    tier = job.get("location_tier")
+    if scope == "local":
+        if tier == 1:
+            label, color = "Local · Remote", "#16a34a"  # green — best
+        elif tier == 2:
+            label, color = "Local (hybrid)", "#0891b2"   # cyan
+        else:  # tier 4 (or unknown local) = on-site
+            label, color = "Local (on-site)", "#7c3aed"  # violet
+    elif scope == "remote" or tier == 3:
+        label, color = "Remote", "#2563eb"               # blue
+    else:
+        return ""
+    return (
+        f'<span style="display:inline-block;background:#f3f4f6;color:{color};'
+        f'padding:2px 10px;border-radius:4px;font-weight:600;font-size:13px;">{label}</span>'
+    )
+
+
+def _commute_color(grade: str) -> str:
+    """Green for a short commute, amber mid, red long. Mirrors _score_color."""
+    return {
+        "A+": "#16a34a", "A": "#16a34a", "B": "#2563eb",
+        "C": "#f59e0b", "D": "#f59e0b", "F": "#991b1b",
+    }.get(grade, "#6b7280")
+
+
+def _commute_badge(job: dict) -> str:
+    """
+    Commute grade + minutes badge, e.g. "🚗 A · 18 min". Only rendered when a
+    commute_grade is present (fully-remote / non-local jobs have none).
+    """
+    grade = job.get("commute_grade")
+    if not grade:
+        return ""
+    mins = job.get("commute_min")
+    mins_txt = ""
+    if mins is not None:
+        try:
+            mins_txt = f" &middot; {round(float(mins))} min"
+        except (TypeError, ValueError):
+            mins_txt = ""
+    color = _commute_color(grade)
+    return (
+        f'<span style="display:inline-block;background:#f3f4f6;color:{color};'
+        f'padding:2px 10px;border-radius:4px;font-weight:600;font-size:13px;">'
+        f'🚗 {grade}{mins_txt}</span>'
+    )
+
+
 _VERDICT_STYLE = {
     "AVOID":      ("#991b1b", "#fef2f2", "🛑 AVOID"),
     "SUSPICIOUS": ("#92400e", "#fffbeb", "⚠️ SUSPICIOUS"),
@@ -223,6 +279,8 @@ def build_email_html(scored_jobs: list) -> str:
         job_type = _format_job_type(job)
         type_color = _badge_color(job_type)
         score_bg = _score_color(score)
+        location_tag = _location_tag(job)
+        commute_badge = _commute_badge(job)
 
         # Build listing link (job_id from Apify is short jobKey, not URL — use job_url_direct)
         listing_url = job.get("job_url_direct") or (job_id if job_id.startswith("http") else "")
@@ -259,6 +317,8 @@ def build_email_html(scored_jobs: list) -> str:
                     <span style="display:inline-block;background:{type_color};color:white;padding:2px 10px;border-radius:4px;font-weight:600;font-size:13px;">{job_type}</span>
                     <span style="display:inline-block;background:#f3f4f6;color:#374151;padding:2px 10px;border-radius:4px;font-size:13px;">{location}</span>
                     <span style="display:inline-block;background:#f3f4f6;color:#374151;padding:2px 10px;border-radius:4px;font-weight:600;font-size:13px;">{salary}</span>
+                    {location_tag}
+                    {commute_badge}
                 </div>
 
                 <div style="margin-top:10px;font-size:14px;color:#374151;line-height:1.5;">{tldr}</div>

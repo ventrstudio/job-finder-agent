@@ -134,7 +134,7 @@ If the description doesn't mention time zone requirements at all, assume flexibl
 **Level:** {job.get('level', 'N/A')}
 
 **Description:**
-{job.get('description', 'No description available')[:4000]}
+{job.get('description', 'No description available')[:6000]}
 
 ---
 
@@ -253,8 +253,12 @@ def score_unscored_jobs(limit: int = None) -> list:
 
         result = score_job(job, profile)
         if result:
-            # Update in Supabase (store score * 10 to fit the 0-100 column)
-            score_for_db = result["score"] * 10
+            # Update in Supabase (store score * 10 to fit the 0-100 column) plus a
+            # location-tier bonus so preferred locations rank higher. Capped at 100
+            # to stay within the column. Jobs with no tier (e.g. alert-ingested)
+            # get 0 bonus.
+            bonus = config.LOCATION_TIER_BONUS.get(job.get("location_tier"), 0)
+            score_for_db = min(100, result["score"] * 10 + bonus)
             supabase_utils.update_job_score(job_id, score_for_db, resume_score_stage="initial")
             # Save scoring details
             try:

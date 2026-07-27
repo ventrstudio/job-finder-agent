@@ -21,6 +21,7 @@ from urllib.parse import quote_plus
 
 from apify_client import ApifyClient
 
+import commute
 import config
 import supabase_utils
 
@@ -257,6 +258,26 @@ def _run_actor(actor_id: str, run_input: dict, source_name: str) -> list:
     return raw_items
 
 
+def _memo23_input(urls: list, max_jobs: int) -> dict:
+    """
+    Build the memo23/apify-indeed-cheerio-ppr run input for a set of startUrls.
+    maxJobs caps the crawl (the cost dial). expandToCities=False stops it fanning
+    a scoped URL into per-city crawls (our URLs are already scoped). flattenOutput
+    gives a flat dict per job (the shape _map_apify_item expects). RESIDENTIAL
+    proxy is what gets past Indeed's bot wall. Factored out so the dedicated
+    remote and local runs share one definition.
+    """
+    return {
+        "startUrls": [{"url": u} for u in urls],
+        "maxJobs": max_jobs,
+        "expandToCities": False,
+        "flattenOutput": True,
+        "includeCompanyDetails": False,
+        "strictMatch": False,
+        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+    }
+
+
 def scrape_all_queries() -> list:
     """
     One Apify run per source (Indeed memo23 + LinkedIn guest search), all
@@ -273,47 +294,55 @@ def scrape_all_queries() -> list:
     existing_ids, existing_company_title_pairs = supabase_utils.get_existing_jobs_from_supabase()
     logging.info(f"Found {len(existing_ids)} existing jobs in database")
 
+    # Two DEDICATED Indeed runs so the local pass gets its own crawl budget. When
+    # remote + local shared one run, the nationwide-remote URLs (crawled first)
+    # ate the whole maxJobs budget and the local URLs returned ~0. Splitting the
+    # budget is the core of the local-jobs fix. Remote uses the narrow high-signal
+    # SEARCH_QUERIES; local uses the broader, high-recall LOCAL_SEARCH_QUERIES.
     remote_urls = [_build_indeed_url(q, remote=True) for q in config.SEARCH_QUERIES]
-    local_urls = [_build_indeed_url(q, remote=False) for q in config.SEARCH_QUERIES]
-    urls = remote_urls + local_urls
+    local_urls = [_build_indeed_url(q, remote=False) for q in config.LOCAL_SEARCH_QUERIES]
     logging.info(
-        f"Built {len(urls)} Indeed URLs for one actor run "
-        f"({len(remote_urls)} remote + {len(local_urls)} local near {config.APIFY_LOCAL_LOCATION})"
+        f"Built {len(remote_urls)} remote + {len(local_urls)} local Indeed URLs "
+        f"(local near {config.APIFY_LOCAL_LOCATION}) for two separate memo23 runs"
     )
 
-    # memo23 schema: startUrls is an array of {url} objects. maxJobs caps the
-    # crawl (the cost dial). expandToCities=False stops it fanning a country/region
-    # URL into per-city crawls (our URLs are already scoped). flattenOutput gives
-    # us a flat dict per job (the shape _map_apify_item expects). RESIDENTIAL proxy
-    # is what gets past Indeed's bot wall.
-    indeed_input = {
-        "startUrls": [{"url": u} for u in urls],
-        "maxJobs": config.APIFY_MAX_ROWS_GLOBAL,
-        "expandToCities": False,
-        "flattenOutput": True,
-        "includeCompanyDetails": False,
-        "strictMatch": False,
-        "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
-    }
-    # (source_name, mapper, raw_items) per source. Indeed first — it's the
-    # richer source (salary fields), so on a cross-source duplicate the Indeed
-    # record wins the dedup race.
+    remote_input = _memo23_input(remote_urls, config.APIFY_MAX_ROWS_GLOBAL)
+    local_input = _memo23_input(local_urls, config.APIFY_LOCAL_MAX_ROWS)
+
+    # (source_name, scope, mapper, raw_items) per source+scope. Indeed first — it's
+    # the richer source (salary fields), so on a cross-source duplicate the Indeed
+    # record wins the dedup race. Remote scope is listed before local within Indeed.
     sources = [
-        ("indeed", _map_apify_item, _run_actor(config.APIFY_ACTOR_ID, indeed_input, "indeed")),
+        ("indeed", "remote", _map_apify_item,
+         _run_actor(config.APIFY_ACTOR_ID, remote_input, "indeed-remote")),
+        ("indeed", "local", _map_apify_item,
+         _run_actor(config.APIFY_ACTOR_ID, local_input, "indeed-local")),
     ]
 
     if config.LINKEDIN_ENABLED:
-        li_urls = [_build_linkedin_url(q, remote=True) for q in config.SEARCH_QUERIES] + [
-            _build_linkedin_url(q, remote=False) for q in config.SEARCH_QUERIES
-        ]
-        logging.info(f"Built {len(li_urls)} LinkedIn URLs for one actor run")
-        linkedin_input = {
-            "urls": li_urls,
+        li_remote_urls = [_build_linkedin_url(q, remote=True) for q in config.SEARCH_QUERIES]
+        li_local_urls = [_build_linkedin_url(q, remote=False) for q in config.LOCAL_SEARCH_QUERIES]
+        logging.info(
+            f"Built {len(li_remote_urls)} remote + {len(li_local_urls)} local "
+            f"LinkedIn URLs for two separate guest-search runs"
+        )
+        li_remote_input = {
+            "urls": li_remote_urls,
             "count": config.LINKEDIN_MAX_ROWS,
             "scrapeCompany": False,
         }
+        li_local_input = {
+            "urls": li_local_urls,
+            "count": config.LINKEDIN_LOCAL_MAX_ROWS,
+            "scrapeCompany": False,
+        }
         sources.append(
-            ("linkedin", _map_linkedin_item, _run_actor(config.LINKEDIN_ACTOR_ID, linkedin_input, "linkedin"))
+            ("linkedin", "remote", _map_linkedin_item,
+             _run_actor(config.LINKEDIN_ACTOR_ID, li_remote_input, "linkedin-remote"))
+        )
+        sources.append(
+            ("linkedin", "local", _map_linkedin_item,
+             _run_actor(config.LINKEDIN_ACTOR_ID, li_local_input, "linkedin-local"))
         )
 
     all_new_jobs = []
@@ -322,9 +351,15 @@ def scrape_all_queries() -> list:
 
     blocklist = [b.lower() for b in config.COMPANY_BLOCKLIST]
 
-    raw_items = [(mapper, item) for _, mapper, items in sources for item in items]
+    # Carry the scope + the RAW item alongside the mapper — the raw item is where
+    # lat/lng live (the mapper drops them), and scope drives the location tier.
+    raw_items = [
+        (scope, mapper, item)
+        for _, scope, mapper, items in sources
+        for item in items
+    ]
 
-    for mapper, item in raw_items:
+    for scope, mapper, item in raw_items:
         job = mapper(item)
         if not job:
             continue
@@ -346,6 +381,32 @@ def scrape_all_queries() -> list:
         desc = job.get("description") or ""
         if len(desc) < 50:
             continue
+
+        # Location scope + tier + commute grade. Tiers (best -> worst): 1 local
+        # + remote, 2 local hybrid, 3 non-local remote, 4 local in-person. Commute
+        # is only graded for tiers that actually require driving (2 hybrid, 4
+        # on-site) — a fully-remote local role (tier 1) has no drive to grade.
+        # Init all four location keys on EVERY job so the batch upsert stays
+        # column-uniform (heterogeneous-key rows can break the PostgREST bulk
+        # upsert). Overridden below where applicable.
+        job["search_scope"] = scope
+        job["commute_min"] = None
+        job["commute_grade"] = None
+        if scope == "local":
+            blob = ((job.get("job_title") or "") + " " + (job.get("description") or "")).lower()
+            tier = 1 if job.get("is_remote") else (2 if "hybrid" in blob else 4)
+            job["location_tier"] = tier
+            if tier in (2, 4):
+                # lat/lng come from the RAW Apify item, NOT the mapped job dict.
+                # LinkedIn guest items usually lack coords -> drive_minutes()
+                # returns None and the grade stays None (guarded downstream).
+                lat = item.get("latitude")
+                lng = item.get("longitude")
+                mins = commute.drive_minutes(lat, lng)
+                job["commute_min"] = round(mins, 1) if mins is not None else None
+                job["commute_grade"] = commute.grade(mins)
+        else:
+            job["location_tier"] = 3
 
         seen_ids.add(job_id)
         all_new_jobs.append(job)
