@@ -76,11 +76,16 @@ APIFY_SORT = "date"  # newest first
 # manual runs. The breadth layer is alert-email ingestion, so the scrape doesn't
 # need to be deep. Bump toward 120-150 only if daily volume ever justifies it.
 APIFY_MAX_ROWS_GLOBAL = 60  # soft ceiling per run = memo23 maxJobs (cost dial)
-# HARD per-run charge cap. memo23 is pay-per-event, so the actor AUTO-ABORTS the run
-# the instant its charges cross this line — a deterministic backstop UNDER the soft
-# maxJobs cap (which overshoots ~25% with many startUrls). The 07-25 runaway was $24.81;
-# with this, any run dies at $1.00 no matter what the input says. Normal run ~$0.10.
-APIFY_MAX_RUN_USD = 1.00
+# HARD per-run charge cap for the scraper.py searches. memo23 is pay-per-event, so the
+# actor AUTO-ABORTS the run the instant its charges cross this line. This is the only
+# deterministic ceiling — maxJobs is a SOFT cap and overshoots badly (measured 08-02-2026:
+# maxJobs=200 billed 400 items, 100% over, not the ~25% previously assumed).
+#
+# Lowered $1.00 -> $0.25 on 08-02-2026. Measured real runs are $0.090 (remote) and $0.051
+# (local), so $1.00 left 10-20x of unused rope for no reason — and rope is exactly what the
+# 07-25 runaway ($24.81) used. $0.25 still leaves ~3x headroom for a heavy day.
+# The alert-enrichment path has its own, much tighter cap: alert_ingest.APIFY_ALERT_MAX_RUN_USD.
+APIFY_MAX_RUN_USD = 0.25
 
 # Local search — on-site/hybrid jobs near home base. Each query runs twice:
 # once nationwide-remote, once location-bound to this area.

@@ -53,13 +53,45 @@ ALL_MAIL = '"[Gmail]/All Mail"'
 LOOKBACK_DAYS = 3             # how far back to scan for unprocessed alerts (daily run)
 MAX_EMAILS_PER_RUN = 8        # cap emails processed per run so a backlog can't blow up Apify cost
 APIFY_FETCH_ROWS_PER_QUERY = 20  # results per company search when fetching full JDs
-# HARD crawl ceiling for this path. memo23's REAL cost dial is maxJobs (it pages the
-# full result set then trims to maxRows) — leaving it at the actor default (20000) +
-# expandToCities default (true) is what let a 14-company run crawl 17,847 jobs = $24.81
-# on 07-25-2026 (85% of the monthly Apify plan in one run). maxRows only trims OUTPUT,
-# not the billed crawl. Always cap maxJobs + set expandToCities=False here (mirrors
-# scraper.py). 200 × ~$0.0014/job ≈ $0.28 worst case even on a big alert day.
+# SOFT crawl ceiling for this path. memo23's maxJobs caps the CRAWL (maxRows only
+# trims OUTPUT), but it is NOT a hard cap — it finishes each startUrl's current page
+# batch, so it overshoots. Measured 08-02-2026: maxJobs=200 billed 400 items (100%
+# over, not the ~25% previously assumed). Leaving it at the actor default (20000) +
+# expandToCities default (true) is what let a 14-company run crawl 17,847 jobs =
+# $24.81 on 07-25-2026, 85% of the monthly plan in ONE run.
+#
+# Because maxJobs is soft, it is NOT the money wall — APIFY_ALERT_MAX_RUN_USD is.
+# Treat this as a hint that keeps normal runs small.
 APIFY_ALERT_MAX_JOBS_CEILING = 200
+
+# THE money wall for this path. Apify AUTO-ABORTS the run the instant its charges
+# cross this number, so it is deterministic in a way no item cap is. Deliberately
+# far tighter than config.APIFY_MAX_RUN_USD ($1.00, used by scraper.py's broader
+# searches): enrichment is a nice-to-have that tops up alert-email stubs, so it
+# gets a hard $0.05/day ceiling (~$1.50/mo) instead of an open-ended crawl.
+#
+# If the cap aborts the run we keep whatever partial dataset was written and stub
+# the rest — bounded-cost enrichment, never an unbounded one. Raise this ONLY
+# after checking the month's remaining headroom.
+APIFY_ALERT_MAX_RUN_USD = 0.05
+
+# Master switch for the Apify JD-enrichment crawl on this path.
+#
+# HISTORY (why this flag exists): from 06-30-2026 (the borderline -> memo23 actor
+# swap) to 08-02-2026 this crawl was 100% waste. borderline returned the Indeed key
+# as `jobKey`; memo23 returns it as `jobId`. The match below was never updated, so
+# it hit zero every single day — verified live on run yYdF4oTzvi7ZjCzMl: 398/398
+# items carried `jobId`, 0 carried `jobKey`. Every target fell through to the
+# alert-email stub while the crawl still billed $0.285-0.563/day (~$8.50-17/mo).
+# Nothing caught it for 33 days because every guard asked "did this cost too much?"
+# and none asked "did this buy anything?" — see the yield check below, which is the
+# actual fix for that class of bug.
+APIFY_ALERT_ENRICH_ENABLED = True
+
+# Yield guard. A paid run that returns zero usable rows is a BUG, not a quiet day.
+# If a run costs more than this and maps nothing, we raise it as a hard ingest error
+# so main.py emails about it, instead of degrading silently into stubs for a month.
+APIFY_ALERT_MIN_COST_TO_ALERT_ON_ZERO_YIELD = 0.01
 
 # Set when the last ingest hit a hard failure (vs a clean "no new jobs" run);
 # main.py can read this to alert, mirroring scraper.LAST_SCRAPE_ERROR.
@@ -67,6 +99,10 @@ LAST_INGEST_ERROR = None
 
 # Indeed alert links look like /rc/clk/dl?jk=<16 hex>&... — jk is the job_id.
 _JK_RE = re.compile(r"[?&]jk=([0-9a-f]{16})", re.I)
+# A bare job key on its own (what memo23 puts in `jobId`), used to sanity-check a
+# field before trusting it as the key — so a renamed/wrong field reads as "no key"
+# rather than silently matching nothing.
+_JK_VALUE_RE = re.compile(r"[0-9a-f]{16}", re.I)
 # Job anchor in the HTML part: <a href="...jk=KEY..." class="strong-text-link">TITLE</a>
 _ANCHOR_RE = re.compile(
     r'<a\s+href="[^"]*?[?&]jk=([0-9a-f]{16})[^"]*?"[^>]*?>(.*?)</a>',
@@ -139,6 +175,42 @@ def parse_alert(plain: str, html: str) -> list:
     return jobs
 
 
+def _run_field(run, attr_name: str, dict_key: str):
+    """
+    Read one field off an Apify run. apify-client 3.x returns a Run model object,
+    2.x returns a plain dict — scraper._run_actor already handles both, so mirror it
+    here rather than assuming a shape and dying inside a broad `except`.
+    """
+    if run is None:
+        return None
+    val = getattr(run, attr_name, None)
+    if val is None and isinstance(run, dict):
+        val = run.get(dict_key)
+    return val
+
+
+def _item_job_key(item: dict) -> str:
+    """
+    Pull the Indeed job key (the 16-hex `jk`) out of a scraper item.
+
+    THE bug this exists to prevent: the key's field name is actor-specific and has
+    already moved once. borderline/indeed-scraper called it `jobKey`; the current
+    memo23/apify-indeed-cheerio-ppr calls it `jobId` (verified live: 398/398 items
+    carried `jobId`, 0 carried `jobKey`). Reading one hard-coded name silently
+    matched nothing for 33 days. So try every known name, then fall back to parsing
+    ?jk= out of the item URL, which is the one place Indeed itself always puts it.
+    """
+    for field in ("jobId", "jobKey", "jobkey", "id"):
+        val = str(item.get(field) or "").strip().lower()
+        if _JK_VALUE_RE.fullmatch(val):
+            return val
+    for field in ("url", "jobUrl", "applyUrl"):
+        m = _JK_RE.search(str(item.get(field) or ""))
+        if m:
+            return m.group(1).lower()
+    return ""
+
+
 def _imap_search(M: imaplib.IMAP4_SSL) -> list:
     """UID-search recent unprocessed Indeed alert emails. Returns a list of UIDs (bytes)."""
     # Gmail search syntax via X-GM-RAW handles the processed-label exclusion cleanly.
@@ -153,7 +225,7 @@ def _fetch_full_jobs(targets: dict) -> list:
     """
     targets: {jk: {"title":..., "company":...}} for the NEW jobs.
     Run one Apify search (by company, falling back to title) and keep only the
-    items whose jobKey is a target. Returns mapped job dicts (scraper schema).
+    items whose Indeed job key is a target. Returns mapped job dicts (scraper schema).
     Any target not surfaced falls back to a minimal row built from the alert data
     so the job still enters the pipeline and gets scored on what we have.
     """
@@ -173,31 +245,29 @@ def _fetch_full_jobs(targets: dict) -> list:
             queries.setdefault(q.lower(), q)
 
     mapped_by_jk = {}
-    if queries:
+    if queries and not APIFY_ALERT_ENRICH_ENABLED:
+        logging.info(
+            f"alert ingest: enrichment disabled (APIFY_ALERT_ENRICH_ENABLED=False) — "
+            f"skipping Apify crawl of {len(queries)} company queries, using alert stubs."
+        )
+    elif queries:
         urls = [
             f"https://www.indeed.com/jobs?q={quote_plus(q)}&sort=date"
             for q in queries.values()
         ]
         try:
             client = _get_client()
-            # COST FIX 07-25-2026: use scraper.py's PROVEN startUrls schema + maxJobs cap
-            # + expandToCities=False. The old input used `urls` and left maxJobs/expandToCities
-            # at the actor DEFAULTS (20000 / true) — maxJobs is memo23's real cost dial (it
-            # caps the CRAWL; maxRows only trims OUTPUT), so a 14-company run crawled 17,847
-            # jobs = $24.81, 85% of the monthly plan in ONE run. Verified: `urls` schema
-            # returns 0 items even when it "works"; startUrls+maxJobs=20 returns items at
-            # $0.007. Also verified the `urls` schema returned 0 mappable rows, so this path
-            # already falls back to alert-email stubs — see KNOWN BUG note below.
-            #
-            # KNOWN BUG (not fixed here — filed separately): the match on line
-            # `item.get("jobKey")` never hits — memo23 items carry NO `jobKey` field (the
-            # Indeed jk lives inside `url` as ?jk=...; the mapper keys on `jobId`). So every
-            # target falls to the stub regardless. This fix makes the (currently useless)
-            # crawl cheap + non-catastrophic; making enrichment actually work is a follow-up.
+            # COST MODEL (see the constants at the top of this file for the full history):
+            #   - maxJobs is a SOFT cap. It overshoots (measured 200 -> 400 billed items).
+            #     It keeps normal runs small; it is NOT the money wall.
+            #   - max_total_charge_usd IS the money wall. Apify auto-aborts the run the
+            #     instant charges cross it, so the ceiling is deterministic.
+            #   - expandToCities MUST stay False. True is what turned a 14-company run into
+            #     a 17,847-job / $24.81 crawl on 07-25-2026.
             max_jobs = min(APIFY_FETCH_ROWS_PER_QUERY * max(1, len(urls)), APIFY_ALERT_MAX_JOBS_CEILING)
             run = client.actor(config.APIFY_ACTOR_ID).call(run_input={
                 "startUrls": [{"url": u} for u in urls],
-                "maxJobs": max_jobs,               # HARD crawl cap (cost dial) — never omit
+                "maxJobs": max_jobs,               # soft crawl hint — never omit
                 "expandToCities": False,           # never fan a search into per-city crawls
                 "flattenOutput": True,
                 "includeCompanyDetails": False,
@@ -205,13 +275,51 @@ def _fetch_full_jobs(targets: dict) -> list:
                 "enableUniqueJobs": True,
                 "includeSimilarJobs": False,
                 "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
-            }, max_total_charge_usd=Decimal(str(config.APIFY_MAX_RUN_USD)))
-            for item in client.dataset(run.default_dataset_id).iterate_items():
-                jk = str(item.get("jobKey") or "").lower()
-                if jk in targets:
-                    job = _map_apify_item(item)
-                    if job:
-                        mapped_by_jk[jk] = job
+            }, max_total_charge_usd=Decimal(str(APIFY_ALERT_MAX_RUN_USD)))
+
+            # An ABORTED run is the charge cap doing its job, not a failure: whatever the
+            # crawl already wrote is still in the dataset and still useful. Read it either
+            # way and let unmatched targets fall through to stubs below.
+            dataset_id = _run_field(run, "default_dataset_id", "defaultDatasetId")
+            run_id = _run_field(run, "id", "id")
+            run_status = _run_field(run, "status", "status")
+            run_cost = float(_run_field(run, "usage_total_usd", "usageTotalUsd") or 0.0)
+            if run_status == "ABORTED":
+                logging.warning(
+                    f"alert ingest: run hit the ${APIFY_ALERT_MAX_RUN_USD} charge cap and "
+                    f"aborted — keeping the partial dataset, stubbing the rest."
+                )
+
+            scanned = 0
+            if dataset_id:
+                for item in client.dataset(dataset_id).iterate_items():
+                    scanned += 1
+                    jk = _item_job_key(item)
+                    if jk and jk in targets:
+                        job = _map_apify_item(item)
+                        if job:
+                            mapped_by_jk[jk] = job
+
+            logging.info(
+                f"alert ingest: enrichment run {run_id} status={run_status} "
+                f"cost=${run_cost:.4f} scanned={scanned} matched={len(mapped_by_jk)}/{len(targets)}"
+            )
+
+            # YIELD GUARD — the check that would have caught the 06-30 -> 08-02 waste on
+            # day one. Cost guards only ask "was this too expensive?"; this asks "did it
+            # buy anything?" A paid run that maps nothing is a bug (renamed field, changed
+            # schema, dead selector), so surface it loudly instead of degrading to stubs.
+            if run_cost > APIFY_ALERT_MIN_COST_TO_ALERT_ON_ZERO_YIELD and not mapped_by_jk:
+                global LAST_INGEST_ERROR
+                LAST_INGEST_ERROR = (
+                    f"Apify enrichment billed ${run_cost:.4f} across {scanned} scanned items "
+                    f"but matched 0 of {len(targets)} target jobs. That is a bug, not a slow "
+                    f"day — the actor's key field has probably been renamed again (it went "
+                    f"jobKey -> jobId in the 06-30-2026 borderline->memo23 swap, which cost "
+                    f"33 days of silent waste). Check the item schema of run {run_id} "
+                    f"before this runs again."
+                )
+                logging.error(f"alert ingest: {LAST_INGEST_ERROR}")
         except Exception as e:
             logging.error(f"alert ingest: Apify JD fetch failed: {e}")
 
